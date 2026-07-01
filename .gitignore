@@ -8,7 +8,8 @@ browser_profile
 venv/
 models
 __pycache__
-logs/
+logs
+.DS_Store
 
 # Other files and folders
 .settings/

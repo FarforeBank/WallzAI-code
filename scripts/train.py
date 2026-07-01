@@ -60,7 +60,7 @@ def load_maskable_model(model_path: Path, env):
 
 
 def main():
-    num_envs = max(1, min(8, os.cpu_count() or 1))
+    num_envs = max(1, min(16, os.cpu_count() or 1))
     print(f"Инициализация {num_envs} параллельных сред...")
     print(
         "Curriculum: "
