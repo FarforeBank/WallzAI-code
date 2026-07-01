@@ -22,6 +22,24 @@ def make_env(rank: int, seed: int = 0):
     return _init
 
 
+def load_maskable_model(model_path: Path, env):
+    """Continue old checkpoints even if only Box bounds changed.
+
+    Older checkpoints were saved with Box(-1, 2, (9, 9, 3), int8). The env shape
+    stayed the same, but the bounds were corrected to Box(0, 10, ...). SB3 checks
+    the full space object on load, so we override the saved metadata.
+    """
+    return MaskablePPO.load(
+        str(model_path),
+        env=env,
+        device="cpu",
+        custom_objects={
+            "observation_space": env.observation_space,
+            "action_space": env.action_space,
+        },
+    )
+
+
 def main():
     num_envs = max(1, min(8, os.cpu_count() or 1))
     print(f"Инициализация {num_envs} параллельных сред...")
@@ -46,7 +64,7 @@ def main():
 
     if model_path.exists():
         print("Найдена существующая модель. Продолжаем обучение...")
-        model = MaskablePPO.load(str(model_path), env=vec_env, device="cpu")
+        model = load_maskable_model(model_path, vec_env)
     else:
         print("Начинаем обучение с нуля...")
         model = MaskablePPO(
