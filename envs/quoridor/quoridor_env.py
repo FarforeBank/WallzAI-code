@@ -46,6 +46,7 @@ class QuoridorEnv(gym.Env):
         opponent_start_advantage_range=(0, 0),
         defensive_wall_reward=False,
         opponent_wall_probability=0.0,
+        self_trap_penalty=False,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -61,6 +62,7 @@ class QuoridorEnv(gym.Env):
         self.opponent_start_advantage_range = opponent_start_advantage_range
         self.defensive_wall_reward = defensive_wall_reward
         self.opponent_wall_probability = float(opponent_wall_probability)
+        self.self_trap_penalty = self_trap_penalty
         self.position_history = []
 
         self.action_space = spaces.Discrete(TOTAL_ACTIONS)
@@ -309,6 +311,40 @@ class QuoridorEnv(gym.Env):
                     actions.add(V_WALL_OFFSET + idx)
         return actions
 
+    def _evaluate_opponent_wall_action(self, action, prev_p1_dist=None, prev_p2_dist=None):
+        parts = self._wall_action_to_parts(action)
+        if parts is None:
+            return None
+        r, c, orientation = parts
+        if not self.engine._wall_slot_is_free(r, c, orientation):
+            return None
+
+        prev_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0) if prev_p1_dist is None else prev_p1_dist
+        prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8) if prev_p2_dist is None else prev_p2_dist
+
+        if orientation == "H":
+            self.engine.horizontal_walls[r, c] = True
+        else:
+            self.engine.vertical_walls[r, c] = True
+        new_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
+        new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
+        if orientation == "H":
+            self.engine.horizontal_walls[r, c] = False
+        else:
+            self.engine.vertical_walls[r, c] = False
+
+        if new_p1_dist == 999 or new_p2_dist == 999:
+            return None
+
+        p1_delta = new_p1_dist - prev_p1_dist
+        p2_delta = new_p2_dist - prev_p2_dist
+        score = p1_delta * 0.95 - max(0, p2_delta) * 0.55
+        if prev_p1_dist <= 4:
+            score += p1_delta * 0.30
+        if p1_delta <= 0:
+            score -= 0.15
+        return score, p1_delta, p2_delta, (r, c, orientation)
+
     def _choose_greedy_opponent_wall(self):
         if self.engine.walls_left[2] <= 0:
             return None
@@ -319,37 +355,42 @@ class QuoridorEnv(gym.Env):
         best_score = 0.05
 
         for action in self._opponent_wall_candidates():
-            parts = self._wall_action_to_parts(action)
-            if parts is None:
+            evaluated = self._evaluate_opponent_wall_action(action, prev_p1_dist, prev_p2_dist)
+            if evaluated is None:
                 continue
-            r, c, orientation = parts
-            if not self.engine.can_place_wall(2, r, c, orientation):
-                continue
-
-            if orientation == "H":
-                self.engine.horizontal_walls[r, c] = True
-            else:
-                self.engine.vertical_walls[r, c] = True
-            new_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
-            new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
-            if orientation == "H":
-                self.engine.horizontal_walls[r, c] = False
-            else:
-                self.engine.vertical_walls[r, c] = False
-
-            p1_delta = new_p1_dist - prev_p1_dist
-            p2_delta = new_p2_dist - prev_p2_dist
-            score = p1_delta * 0.95 - max(0, p2_delta) * 0.55
-            if prev_p1_dist <= 4:
-                score += p1_delta * 0.30
-            if p1_delta <= 0:
-                score -= 0.15
-
+            score, _, _, wall = evaluated
             if score > best_score:
                 best_score = score
-                best = (r, c, orientation)
+                best = wall
 
         return best
+
+    def _self_trap_penalty_value(self, current_p1_dist):
+        if not self.self_trap_penalty or self.engine.walls_left[2] <= 0:
+            return 0.0
+
+        prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
+        best_delta = 0
+        best_score = 0.0
+        for action in self._opponent_wall_candidates():
+            evaluated = self._evaluate_opponent_wall_action(action, current_p1_dist, prev_p2_dist)
+            if evaluated is None:
+                continue
+            score, p1_delta, _, _ = evaluated
+            if p1_delta > best_delta or score > best_score:
+                best_delta = max(best_delta, p1_delta)
+                best_score = max(best_score, score)
+
+        if best_delta <= 0:
+            return 0.0
+
+        # Penalize moves that allow the opponent to close a corridor/trap next turn.
+        # The penalty is strongest when we are already near the finish, where one bad
+        # self-trap often loses the game in Wallz.
+        penalty = min(1.35, best_delta * 0.24 + max(0.0, best_score) * 0.08)
+        if current_p1_dist <= 5:
+            penalty *= 1.25
+        return -penalty
 
     def _opponent_step(self):
         if self.opponent_policy == "none":
@@ -442,6 +483,7 @@ class QuoridorEnv(gym.Env):
             if abs(dx) + abs(dy) >= 2:
                 reward += 0.08
             reward += self._repeat_penalty(new_pos)
+            reward += self._self_trap_penalty_value(new_p1_dist)
 
             if self.defensive_wall_reward and prev_p2_dist <= 3 and self.engine.walls_left[1] > 0 and new_p1_dist > 0:
                 reward -= 0.55 + (3 - prev_p2_dist) * 0.20
