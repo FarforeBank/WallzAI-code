@@ -66,6 +66,10 @@ def _looks_teal(item: dict) -> bool:
 
 
 def _looks_red(item: dict) -> bool:
+    text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
+    if any(token in text for token in ("pink", "rose", "red", "crimson", "salmon")):
+        return True
+
     for key in ("fill", "stroke"):
         rgb = _rgb(item.get(key, ""))
         if rgb is None:
@@ -74,6 +78,14 @@ def _looks_red(item: dict) -> bool:
         if red >= green + 15 and red >= blue - 10:
             return True
     return False
+
+
+def _pawn_color_key(item: dict) -> str:
+    if _looks_teal(item):
+        return "teal"
+    if _looks_red(item):
+        return "red"
+    return "unknown"
 
 
 def _cluster_axis(values, expected=9):
@@ -135,6 +147,8 @@ class BrowserAgent:
         self.local_env = QuoridorEnv()
         self.obs, _ = self.local_env.reset()
         self.position_history = []
+        self.own_color_key = None
+        self.last_own_screen_xy = None
 
         if MODEL_PATH.exists():
             self.model = load_maskable_model(MODEL_PATH, self.local_env)
@@ -317,14 +331,40 @@ class BrowserAgent:
         if not pawns:
             pawns = sorted(circles, key=lambda circle: circle["r"], reverse=True)[:2]
 
-        # In online games our color can be teal or pink, but the user plays from the
-        # bottom side. Pick the lower large pawn as ours and the upper large pawn as
-        # the opponent. This avoids confusing a teal opponent for our own pawn.
-        own = max(pawns, key=lambda circle: (circle["y"], circle["r"]))
+        def distance_to_last(circle):
+            if self.last_own_screen_xy is None:
+                return 0.0
+            lx, ly = self.last_own_screen_xy
+            return abs(circle["x"] - lx) + abs(circle["y"] - ly)
+
+        # First bind: in this setup the user starts from the bottom side.
+        # After that, track by the pawn's color so we do not swap identity when
+        # the opponent moves below/near us.
+        if self.own_color_key is None:
+            own = max(pawns, key=lambda circle: (circle["y"], circle["r"]))
+            self.own_color_key = _pawn_color_key(own)
+            print(f"[Зрение] Привязал свою фишку: color={self.own_color_key}")
+        else:
+            same_color = [circle for circle in pawns if _pawn_color_key(circle) == self.own_color_key]
+            if same_color:
+                own = min(same_color, key=distance_to_last)
+            else:
+                # Color detection can fail for a frame; use nearest-to-last before falling back.
+                own = min(pawns, key=distance_to_last) if self.last_own_screen_xy else max(pawns, key=lambda circle: (circle["y"], circle["r"]))
+
+        self.last_own_screen_xy = (own["x"], own["y"])
         opponent_candidates = [circle for circle in pawns if circle is not own]
-        opponent = min(opponent_candidates, key=lambda circle: (circle["y"], -circle["r"])) if opponent_candidates else None
+        if self.last_own_screen_xy:
+            opponent = max(opponent_candidates, key=lambda circle: distance_to_last(circle)) if opponent_candidates else None
+        else:
+            opponent = min(opponent_candidates, key=lambda circle: (circle["y"], -circle["r"])) if opponent_candidates else None
 
         return own, opponent
+
+    def _reset_identity(self):
+        self.position_history.clear()
+        self.own_color_key = None
+        self.last_own_screen_xy = None
 
     def _sync_env_from_screen(self, own, opponent, state, centers):
         p1_pos = self._grid_pos(own, centers)
@@ -422,7 +462,7 @@ class BrowserAgent:
                 p1_pos, p2_pos, wall_counts = self._sync_env_from_screen(own, opponent, state, centers)
                 if p1_pos[1] == 0 or p2_pos[1] == 8:
                     print(f"[Ожидание] Матч, похоже, завершён | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
-                    self.position_history.clear()
+                    self._reset_identity()
                     time.sleep(1.0)
                     continue
 
