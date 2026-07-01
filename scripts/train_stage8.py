@@ -21,7 +21,8 @@ from envs.quoridor.quoridor_env import MOVE_ACTIONS, QuoridorEnv as BaseQuoridor
 
 STAGE8 = {
     "name": "race-finish-wall-timing-finetune",
-    "model_dir": "best_model",
+    "model_dir": "best_model_stage8",
+    "source_model_dir": "best_model",
     "random_walls_range": (0, 2),
     "move_only": False,
     "repeat_penalty": True,
@@ -47,49 +48,86 @@ class RaceFinishQuoridorEnv(BaseQuoridorEnv):
     - reward direct progress more when close to the finish;
     - punish sideways/backward moves near the finish;
     - punish non-urgent walls when our path is already short;
-    - reward emergency walls only when they actually increase opponent BFS distance.
+    - reward emergency walls only when they immediately increase opponent BFS distance.
     """
+
+    def _immediate_wall_delta(self, action, prev_p1_dist, prev_p2_dist):
+        """Return wall BFS deltas before the opponent gets a reply move.
+
+        Base env.step() lets the opponent act after our wall. Measuring the wall
+        after that move can make a correct emergency wall look useless because the
+        opponent has already consumed one turn of the slowdown. This helper measures
+        the direct wall effect only, then always rolls the temporary wall back.
+        """
+        parts = self._wall_action_to_parts(action)
+        if parts is None:
+            return None
+
+        r, c, orientation = parts
+        if not self.engine.can_place_wall(1, r, c, orientation):
+            return None
+
+        wall_array = self.engine.horizontal_walls if orientation == "H" else self.engine.vertical_walls
+        wall_array[r, c] = True
+        try:
+            new_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
+            new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
+        finally:
+            wall_array[r, c] = False
+
+        return new_p1_dist - prev_p1_dist, new_p2_dist - prev_p2_dist
 
     def step(self, action):
         action = int(action)
         prev_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
         prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
         was_wall = action >= MOVE_ACTIONS
+        wall_delta = self._immediate_wall_delta(action, prev_p1_dist, prev_p2_dist) if was_wall else None
 
         obs, reward, terminated, truncated, info = super().step(action)
 
         new_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
         new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
         p1_progress = prev_p1_dist - new_p1_dist
-        p2_slowdown = new_p2_dist - prev_p2_dist
+        p2_reply_progress = prev_p2_dist - new_p2_dist
+        wall_own_delta = wall_delta[0] if wall_delta is not None else 0
+        wall_p2_slowdown = wall_delta[1] if wall_delta is not None else 0
 
         # Endgame: if we can finish soon, teach the policy to actually run.
         if prev_p1_dist <= 5:
             if not was_wall:
                 if p1_progress > 0:
-                    reward += 0.28 + 0.45 * p1_progress
+                    reward += 0.30 + 0.50 * p1_progress
                 else:
+                    reward -= 0.50
+            else:
+                # Near finish, non-urgent walls are bad, but real emergency walls
+                # should survive this wrapper even after the opponent spends a turn.
+                if prev_p2_dist > 3:
+                    reward -= 0.65
+                if wall_p2_slowdown <= 0:
                     reward -= 0.45
-            else:
-                # Near finish, walls are only worth it if opponent is also dangerous
-                # and the wall measurably slows them.
-                if prev_p2_dist > 2:
-                    reward -= 0.55
-                if p2_slowdown <= 0:
-                    reward -= 0.35
-                if new_p1_dist > prev_p1_dist:
-                    reward -= 0.25
+                if wall_own_delta > 0:
+                    reward -= 0.30
 
-        # Emergency defense: reward walls only when they really delay an opponent
-        # who is close to winning. This should reduce random wall spam.
+        # Emergency defense: use the immediate wall effect, not the post-opponent
+        # board state, otherwise good last-moment walls get mislabeled as useless.
         if was_wall and prev_p2_dist <= 3:
-            if p2_slowdown > 0:
-                reward += 0.45 + 0.35 * p2_slowdown
+            if wall_p2_slowdown > 0:
+                reward += 0.55 + 0.40 * wall_p2_slowdown
             else:
-                reward -= 0.35
+                reward -= 0.45
+
+        # Anti-spam: outside urgent races, only accept walls that immediately slow
+        # the opponent more than they hurt our own path.
+        if was_wall and prev_p1_dist > 5 and prev_p2_dist > 3:
+            if wall_p2_slowdown <= 0:
+                reward -= 0.20
+            if wall_own_delta > wall_p2_slowdown:
+                reward -= 0.20
 
         # Race pressure: do not let the opponent walk freely into the finish.
-        if not was_wall and prev_p2_dist <= 2 and new_p2_dist <= prev_p2_dist:
+        if not was_wall and prev_p2_dist <= 2 and p2_reply_progress >= 0:
             reward -= 0.20
 
         return obs, reward, terminated, truncated, info
@@ -209,7 +247,7 @@ def main():
     print(STAGE8["description"])
     print(
         "Curriculum: "
-        f"model_dir={STAGE8['model_dir']}, "
+        f"model_dir={STAGE8['model_dir']}, source_model_dir={STAGE8['source_model_dir']}, "
         f"random_walls={STAGE8['random_walls_range']}, "
         f"move_only={STAGE8['move_only']}, repeat_penalty={STAGE8['repeat_penalty']}, "
         f"opponent={STAGE8['opponent_policy']}, opponent_randomness={STAGE8['opponent_randomness']}, "
@@ -224,6 +262,7 @@ def main():
     eval_env = make_eval_env()
 
     save_path = ROOT_DIR / "models" / STAGE8["model_dir"]
+    source_model_path = ROOT_DIR / "models" / STAGE8["source_model_dir"] / "best_model.zip"
     log_path = ROOT_DIR / "logs" / "eval" / f"stage_8_{STAGE8['name']}"
     save_path.mkdir(parents=True, exist_ok=True)
     log_path.mkdir(parents=True, exist_ok=True)
@@ -241,28 +280,34 @@ def main():
 
     if args.reset:
         backup_existing_model(model_path, save_path, "reset_stage_8")
-        print("--reset указан. Начинаем новую smart-модель.")
+        print("--reset указан. Начинаем новую Stage 8 модель.")
         model = create_new_model(vec_env, device)
     elif model_path.exists():
         backup_existing_model(model_path, save_path, "stage_8")
-        print("Пробуем загрузить совместимую smart-модель...")
+        print("Пробуем загрузить совместимую Stage 8 модель...")
         try:
             model = load_maskable_model(model_path, vec_env, device)
-            print("Совместимая smart-модель найдена. Продолжаем обучение.")
+            print("Совместимая Stage 8 модель найдена. Продолжаем обучение.")
         except Exception as exc:
-            print(f"Старая модель несовместима ({type(exc).__name__}). Стартуем smart-модель с нуля.")
-            model = create_new_model(vec_env, device)
+            print(f"Stage 8 модель несовместима ({type(exc).__name__}). Пробую source-модель.")
+            if source_model_path.exists():
+                model = load_maskable_model(source_model_path, vec_env, device)
+            else:
+                model = create_new_model(vec_env, device)
+    elif source_model_path.exists():
+        print(f"Stage 8 модель не найдена. Загружаю source-модель: {source_model_path}")
+        model = load_maskable_model(source_model_path, vec_env, device)
     else:
-        print("Модель не найдена. Стартуем smart-модель с нуля.")
+        print("Модель не найдена. Стартуем Stage 8 модель с нуля.")
         model = create_new_model(vec_env, device)
 
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
         model.learn(total_timesteps=timesteps, callback=eval_callback, progress_bar=True)
     except KeyboardInterrupt:
-        save_model_safely(model, model_path, "Обучение прервано пользователем.")
+        save_model_safely(model, save_path / "last_model.zip", "Обучение прервано пользователем.")
     except Exception as exc:
-        save_model_safely(model, model_path, f"Обучение упало с ошибкой {type(exc).__name__}:")
+        save_model_safely(model, save_path / "crashed_model.zip", f"Обучение упало с ошибкой {type(exc).__name__}:")
         raise
     finally:
         try:
