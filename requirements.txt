@@ -1,0 +1,7 @@
+gymnasium
+numpy
+playwright
+stable-baselines3
+sb3-contrib
+tqdm
+rich
