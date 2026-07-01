@@ -8,10 +8,20 @@ from envs.quoridor.engine import QuoridorEngine
 class QuoridorEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self, render_mode=None):
+    def __init__(
+        self,
+        render_mode=None,
+        random_walls_range=(0, 0),
+        move_only=False,
+        repeat_penalty=False,
+    ):
         super().__init__()
         self.render_mode = render_mode
         self.engine = QuoridorEngine()
+        self.random_walls_range = random_walls_range
+        self.move_only = move_only
+        self.repeat_penalty = repeat_penalty
+        self.position_history = []
 
         # 0-3: movement actions
         # 4-67: horizontal walls
@@ -34,7 +44,34 @@ class QuoridorEnv(gym.Env):
         super().reset(seed=seed)
         self.engine.reset()
         self.current_step = 0
+        self.position_history = [self.engine.p1_pos]
+        self._place_random_walls()
         return self._get_obs(), {}
+
+    def _random_wall_count(self):
+        low, high = self.random_walls_range
+        low = max(0, int(low))
+        high = max(low, int(high))
+        if high == 0:
+            return 0
+        return int(self.np_random.integers(low, high + 1))
+
+    def _place_random_walls(self):
+        target_count = self._random_wall_count()
+        if target_count <= 0:
+            return
+
+        placed = 0
+        attempts = 0
+        max_attempts = target_count * 80
+
+        while placed < target_count and attempts < max_attempts:
+            attempts += 1
+            r = int(self.np_random.integers(0, 8))
+            c = int(self.np_random.integers(0, 8))
+            orientation = "H" if int(self.np_random.integers(0, 2)) == 0 else "V"
+            if self.engine.place_wall(2, r, c, orientation):
+                placed += 1
 
     def _get_obs(self):
         obs = np.zeros((9, 9, 3), dtype=np.int8)
@@ -57,6 +94,9 @@ class QuoridorEnv(gym.Env):
             if (cx + dx, cy + dy) in valid_moves:
                 mask[i] = True
 
+        if self.move_only:
+            return mask
+
         # 2. Horizontal wall actions
         for i in range(64):
             r, c = divmod(i, 8)
@@ -71,6 +111,17 @@ class QuoridorEnv(gym.Env):
 
         return mask
 
+    def _repeat_penalty(self, new_pos):
+        if not self.repeat_penalty:
+            return 0.0
+
+        penalty = 0.0
+        if len(self.position_history) >= 2 and new_pos == self.position_history[-2]:
+            penalty -= 0.25  # immediate backtracking
+        if new_pos in self.position_history[-6:]:
+            penalty -= 0.05  # short loop
+        return penalty
+
     def step(self, action):
         action = int(action)
         if not self.action_space.contains(action):
@@ -78,7 +129,8 @@ class QuoridorEnv(gym.Env):
 
         self.current_step += 1
         target_row = 0
-        prev_dist = self.engine.get_bfs_distance(self.engine.p1_pos, target_row)
+        prev_pos = self.engine.p1_pos
+        prev_dist = self.engine.get_bfs_distance(prev_pos, target_row)
         valid_action = bool(self.action_masks()[action])
 
         if valid_action:
@@ -96,14 +148,19 @@ class QuoridorEnv(gym.Env):
                 idx = action - 68
                 self.engine.place_wall(1, idx // 8, idx % 8, "V")
 
-        new_dist = self.engine.get_bfs_distance(self.engine.p1_pos, target_row)
+        new_pos = self.engine.p1_pos
+        new_dist = self.engine.get_bfs_distance(new_pos, target_row)
 
         if not valid_action:
             reward = -0.2
         elif action < 4:
-            reward = (prev_dist - new_dist) * 0.1
+            reward = (prev_dist - new_dist) * 0.15 - 0.01
+            reward += self._repeat_penalty(new_pos)
         else:
             reward = -0.01
+
+        if valid_action and action < 4:
+            self.position_history.append(new_pos)
 
         terminated = False
         if new_dist == 0 or self.engine.p1_pos[1] == target_row:
