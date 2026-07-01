@@ -8,6 +8,7 @@ browser_profile
 venv/
 models
 __pycache__
+logs/
 
 # Other files and folders
 .settings/
