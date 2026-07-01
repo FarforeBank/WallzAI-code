@@ -19,17 +19,18 @@ if str(ROOT_DIR) not in sys.path:
 
 from envs.quoridor.quoridor_env import QuoridorEnv
 
-# Stage 3 curriculum: real movement rules.
-# Action space now includes normal moves, jumps, and diagonals around the opponent.
-# Because the action-space size changed, the old 132-action checkpoint is backed up
-# and training starts from a fresh 140-action policy.
-RANDOM_WALLS_RANGE = (0, 6)
-MOVE_ONLY = True
+# Stage 4 curriculum: smart model.
+# Observation is now (9, 9, 5): board, H walls, V walls, our BFS map, opponent BFS map.
+# The policy can use real moves, jumps/diagonals, and wall placement.
+RANDOM_WALLS_RANGE = (0, 4)
+MOVE_ONLY = False
 REPEAT_PENALTY = True
 OPPONENT_POLICY = "greedy"
-OPPONENT_RANDOMNESS = 0.10
+OPPONENT_RANDOMNESS = 0.15
+SMART_OBSERVATION = True
+WALL_REWARD = True
 SHOW_PROGRESS_BAR = True
-FORCE_NEW_MODEL_FOR_REAL_MOVES = True
+FORCE_NEW_SMART_MODEL = True
 
 
 def make_quoridor_env():
@@ -39,6 +40,8 @@ def make_quoridor_env():
         repeat_penalty=REPEAT_PENALTY,
         opponent_policy=OPPONENT_POLICY,
         opponent_randomness=OPPONENT_RANDOMNESS,
+        smart_observation=SMART_OBSERVATION,
+        wall_reward=WALL_REWARD,
     )
 
 
@@ -56,7 +59,7 @@ def make_eval_env():
 
 
 def load_maskable_model(model_path: Path, env):
-    """Continue compatible checkpoints even if only Box bounds changed."""
+    """Continue compatible checkpoints only."""
     return MaskablePPO.load(
         str(model_path),
         env=env,
@@ -83,6 +86,7 @@ def create_new_model(vec_env):
         n_steps=1024,
         batch_size=512,
         clip_range=0.1,
+        ent_coef=0.01,
     )
 
 
@@ -94,7 +98,8 @@ def main():
         f"random_walls={RANDOM_WALLS_RANGE}, "
         f"move_only={MOVE_ONLY}, repeat_penalty={REPEAT_PENALTY}, "
         f"opponent={OPPONENT_POLICY}, opponent_randomness={OPPONENT_RANDOMNESS}, "
-        f"progress_bar={SHOW_PROGRESS_BAR}, real_moves=True"
+        f"smart_observation={SMART_OBSERVATION}, wall_reward={WALL_REWARD}, "
+        f"progress_bar={SHOW_PROGRESS_BAR}"
     )
 
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)], start_method="spawn")
@@ -111,19 +116,19 @@ def main():
         best_model_save_path=str(save_path),
         log_path=str(log_path),
         eval_freq=max(1, 50_000 // num_envs),
-        n_eval_episodes=30,
+        n_eval_episodes=40,
         deterministic=True,
         render=False,
     )
 
     if model_path.exists():
-        backup_path = save_path / "base_before_real_moves.zip"
+        backup_path = save_path / "base_before_smart_wall_model.zip"
         if not backup_path.exists():
             backup_path.write_bytes(model_path.read_bytes())
-            print(f"Сохранил backup старой 132-action модели: {backup_path}")
+            print(f"Сохранил backup старой модели: {backup_path}")
 
-    if FORCE_NEW_MODEL_FOR_REAL_MOVES or not model_path.exists():
-        print("Stage 3: action space изменился. Начинаем новую 140-action модель...")
+    if FORCE_NEW_SMART_MODEL or not model_path.exists():
+        print("Stage 4: новый smart observation. Начинаем новую модель с нуля...")
         model = create_new_model(vec_env)
     else:
         print("Найдена совместимая модель. Продолжаем обучение...")
@@ -136,7 +141,7 @@ def main():
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
         model.learn(
-            total_timesteps=3_000_000,
+            total_timesteps=5_000_000,
             callback=eval_callback,
             progress_bar=SHOW_PROGRESS_BAR,
         )
