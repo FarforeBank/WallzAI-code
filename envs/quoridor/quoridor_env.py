@@ -43,6 +43,8 @@ class QuoridorEnv(gym.Env):
         smart_observation=True,
         wall_reward=True,
         wall_candidate_limit=32,
+        opponent_start_advantage_range=(0, 0),
+        defensive_wall_reward=False,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -55,6 +57,8 @@ class QuoridorEnv(gym.Env):
         self.smart_observation = smart_observation
         self.wall_reward = wall_reward
         self.wall_candidate_limit = wall_candidate_limit
+        self.opponent_start_advantage_range = opponent_start_advantage_range
+        self.defensive_wall_reward = defensive_wall_reward
         self.position_history = []
 
         # 0-11: movement actions, including jumps and diagonals
@@ -82,8 +86,9 @@ class QuoridorEnv(gym.Env):
         super().reset(seed=seed)
         self.engine.reset()
         self.current_step = 0
-        self.position_history = [self.engine.p1_pos]
         self._place_random_walls()
+        self._apply_opponent_start_advantage()
+        self.position_history = [self.engine.p1_pos]
         return self._get_obs(), {}
 
     def _random_wall_count(self):
@@ -111,12 +116,24 @@ class QuoridorEnv(gym.Env):
             if self.engine.place_wall(2, r, c, orientation):
                 placed += 1
 
-    def _distance_map_to_row(self, target_row):
-        """Return clipped BFS distance from every cell to a target row.
+    def _apply_opponent_start_advantage(self):
+        low, high = self.opponent_start_advantage_range
+        low = max(0, int(low))
+        high = max(low, int(high))
+        if high <= 0:
+            return
 
-        This is a navigation hint, not a hard-coded action. It lets the policy see
-        the maze gradient created by all walls, including U-shaped traps.
-        """
+        steps = int(self.np_random.integers(low, high + 1))
+        for _ in range(steps):
+            move = self._choose_greedy_opponent_move()
+            if move is None:
+                break
+            self._move_player_to(2, move)
+            if self._is_p2_win():
+                break
+
+    def _distance_map_to_row(self, target_row):
+        """Return clipped BFS distance from every cell to a target row."""
         distances = np.full((9, 9), 10, dtype=np.int8)
         queue = deque()
 
@@ -164,13 +181,7 @@ class QuoridorEnv(gym.Env):
         return None
 
     def _nearby_wall_candidates(self):
-        """Return a compact set of wall actions worth considering.
-
-        Checking all 128 walls is very expensive because every legality check runs
-        path-existence BFS for both players. For learning, most useful walls are near
-        the opponent, near our pawn, or around the center race corridor, so we mask a
-        ranked candidate subset in wall stages.
-        """
+        """Return a compact set of wall actions worth considering."""
         limit = self.wall_candidate_limit
         if limit is None or limit >= 128:
             return list(range(H_WALL_OFFSET, TOTAL_ACTIONS))
@@ -183,14 +194,15 @@ class QuoridorEnv(gym.Env):
             (p2x, p2y),
             (p2x, min(8, p2y + 1)),
             (p2x, min(8, p2y + 2)),
+            (p2x, max(0, p2y - 1)),
             (p1x, p1y),
             (4, 4),
         ]
 
         actions = set()
         for ax, ay in anchors:
-            for dy in range(-2, 3):
-                for dx in range(-2, 3):
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
                     r = max(0, min(7, ay + dy))
                     c = max(0, min(7, ax + dx))
                     idx = r * 8 + c
@@ -199,23 +211,24 @@ class QuoridorEnv(gym.Env):
 
         def score(action):
             r, c, orientation = self._wall_action_to_parts(action)
-            # Approximate wall center in cell coordinates.
             wx = c + 0.5
             wy = r + 0.5
             near_opponent = abs(wx - p2x) + abs(wy - p2y)
             near_us = abs(wx - p1x) + abs(wy - p1y)
             center_bias = abs(wx - 4) * 0.15
-            # Horizontal walls ahead of the opponent often slow vertical progress;
-            # vertical walls around corridors create side traps. Keep both, but rank.
+            danger_bias = 0.0
+            if self.defensive_wall_reward:
+                # In defensive curriculum, bias harder toward walls directly in front
+                # of the opponent's race lane.
+                danger_bias = max(0, wy - p2y) * 0.05
             orientation_bias = 0.0 if orientation == "H" else 0.08
-            return near_opponent + 0.30 * near_us + center_bias + orientation_bias
+            return near_opponent + 0.25 * near_us + center_bias + danger_bias + orientation_bias
 
         return sorted(actions, key=score)[: int(limit)]
 
     def action_masks(self):
         mask = np.zeros(self.action_space.n, dtype=bool)
 
-        # 1. Movement actions
         valid_moves = self.engine.get_valid_moves(1)
         cx, cy = self.engine.p1_pos
         for i, (dx, dy) in enumerate(MOVES):
@@ -225,7 +238,6 @@ class QuoridorEnv(gym.Env):
         if self.move_only:
             return mask
 
-        # 2. Candidate wall actions only. This is much faster than checking all 128.
         for action in self._nearby_wall_candidates():
             r, c, orientation = self._wall_action_to_parts(action)
             if self.engine.can_place_wall(1, r, c, orientation):
@@ -266,9 +278,9 @@ class QuoridorEnv(gym.Env):
 
         penalty = 0.0
         if len(self.position_history) >= 2 and new_pos == self.position_history[-2]:
-            penalty -= 0.45  # immediate backtracking
+            penalty -= 0.45
         if new_pos in self.position_history[-8:]:
-            penalty -= 0.12  # short loop
+            penalty -= 0.12
         return penalty
 
     def _choose_greedy_opponent_move(self):
@@ -316,16 +328,26 @@ class QuoridorEnv(gym.Env):
         opponent_delta = new_p2_dist - prev_p2_dist
         own_delta = new_p1_dist - prev_p1_dist
 
-        # Good walls slow the opponent more than they slow us.
+        if self.defensive_wall_reward:
+            reward = -0.02
+            reward += max(0, opponent_delta) * 0.95
+            reward -= max(0, own_delta) * 0.30
+
+            if prev_p2_dist <= 4:
+                if opponent_delta > 0:
+                    reward += 0.45 + (4 - prev_p2_dist) * 0.12
+                else:
+                    reward -= 0.35
+            if own_delta > opponent_delta:
+                reward -= 0.30
+            return reward
+
         reward = -0.08
         reward += max(0, opponent_delta) * 0.45
         reward -= max(0, own_delta) * 0.35
 
-        # Strongly discourage wasting walls that do not change the race.
         if opponent_delta <= 0 and own_delta <= 0:
             reward -= 0.22
-
-        # Discourage self-blocking even if opponent is also slowed.
         if own_delta > opponent_delta:
             reward -= 0.25
 
@@ -344,7 +366,7 @@ class QuoridorEnv(gym.Env):
         prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, p2_target_row)
         valid_action = self._is_action_valid(action)
 
-        reward = -0.02  # time pressure: win quickly
+        reward = -0.02
 
         if not valid_action:
             reward -= 1.0
@@ -357,8 +379,14 @@ class QuoridorEnv(gym.Env):
 
             reward += (prev_p1_dist - new_p1_dist) * 0.35
             if abs(dx) + abs(dy) >= 2:
-                reward += 0.08  # encourage real jump/diagonal usage when available
+                reward += 0.08
             reward += self._repeat_penalty(new_pos)
+
+            if self.defensive_wall_reward and prev_p2_dist <= 3 and self.engine.walls_left[1] > 0 and new_p1_dist > 0:
+                # In defensive curriculum, moving while the opponent is about to finish
+                # should be costly unless the move wins immediately.
+                reward -= 0.55 + (3 - prev_p2_dist) * 0.20
+
             self.position_history.append(new_pos)
         elif action < V_WALL_OFFSET:
             idx = action - H_WALL_OFFSET
@@ -383,6 +411,9 @@ class QuoridorEnv(gym.Env):
             if moved:
                 new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, p2_target_row)
                 reward -= max(0, prev_p2_dist - new_p2_dist) * 0.10
+
+                if self.defensive_wall_reward and new_p2_dist <= 2 and self.engine.walls_left[1] > 0:
+                    reward -= 0.30
 
             if self._is_p2_win():
                 reward -= 12.0
