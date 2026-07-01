@@ -45,6 +45,7 @@ class QuoridorEnv(gym.Env):
         wall_candidate_limit=32,
         opponent_start_advantage_range=(0, 0),
         defensive_wall_reward=False,
+        opponent_wall_probability=0.0,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -59,19 +60,10 @@ class QuoridorEnv(gym.Env):
         self.wall_candidate_limit = wall_candidate_limit
         self.opponent_start_advantage_range = opponent_start_advantage_range
         self.defensive_wall_reward = defensive_wall_reward
+        self.opponent_wall_probability = float(opponent_wall_probability)
         self.position_history = []
 
-        # 0-11: movement actions, including jumps and diagonals
-        # 12-75: horizontal walls
-        # 76-139: vertical walls
         self.action_space = spaces.Discrete(TOTAL_ACTIONS)
-
-        # Channels:
-        # 0 board: 0 empty, 1 us, 2 opponent
-        # 1 horizontal walls + remaining wall hints
-        # 2 vertical walls
-        # 3 our BFS distance-to-goal map
-        # 4 opponent BFS distance-to-goal map
         self.observation_space = spaces.Box(
             low=0,
             high=10,
@@ -133,7 +125,6 @@ class QuoridorEnv(gym.Env):
                 break
 
     def _distance_map_to_row(self, target_row):
-        """Return clipped BFS distance from every cell to a target row."""
         distances = np.full((9, 9), 10, dtype=np.int8)
         queue = deque()
 
@@ -165,8 +156,6 @@ class QuoridorEnv(gym.Env):
         obs[:8, :8, 2] = self.engine.vertical_walls.astype(np.int8)
         obs[:, :, 3] = self._distance_map_to_row(0)
         obs[:, :, 4] = self._distance_map_to_row(8)
-
-        # Remaining wall hints. Values are in [0, 10], so they fit the Box bounds.
         obs[8, 0, 1] = self.engine.walls_left[1]
         obs[8, 1, 1] = self.engine.walls_left[2]
         return obs
@@ -181,7 +170,6 @@ class QuoridorEnv(gym.Env):
         return None
 
     def _nearby_wall_candidates(self):
-        """Return a compact set of wall actions worth considering."""
         limit = self.wall_candidate_limit
         if limit is None or limit >= 128:
             return list(range(H_WALL_OFFSET, TOTAL_ACTIONS))
@@ -218,8 +206,6 @@ class QuoridorEnv(gym.Env):
             center_bias = abs(wx - 4) * 0.15
             danger_bias = 0.0
             if self.defensive_wall_reward:
-                # In defensive curriculum, bias harder toward walls directly in front
-                # of the opponent's race lane.
                 danger_bias = max(0, wy - p2y) * 0.05
             orientation_bias = 0.0 if orientation == "H" else 0.08
             return near_opponent + 0.25 * near_us + center_bias + danger_bias + orientation_bias
@@ -301,11 +287,86 @@ class QuoridorEnv(gym.Env):
 
         return min(valid_moves, key=score)
 
+    def _opponent_wall_candidates(self):
+        if self.engine.walls_left[2] <= 0:
+            return []
+
+        p1x, p1y = self.engine.p1_pos
+        anchors = [
+            (p1x, p1y),
+            (p1x, max(0, p1y - 1)),
+            (p1x, max(0, p1y - 2)),
+            (4, p1y),
+        ]
+        actions = set()
+        for ax, ay in anchors:
+            for dy in range(-2, 3):
+                for dx in range(-3, 4):
+                    r = max(0, min(7, ay + dy))
+                    c = max(0, min(7, ax + dx))
+                    idx = r * 8 + c
+                    actions.add(H_WALL_OFFSET + idx)
+                    actions.add(V_WALL_OFFSET + idx)
+        return actions
+
+    def _choose_greedy_opponent_wall(self):
+        if self.engine.walls_left[2] <= 0:
+            return None
+
+        prev_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
+        prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
+        best = None
+        best_score = 0.05
+
+        for action in self._opponent_wall_candidates():
+            parts = self._wall_action_to_parts(action)
+            if parts is None:
+                continue
+            r, c, orientation = parts
+            if not self.engine.can_place_wall(2, r, c, orientation):
+                continue
+
+            if orientation == "H":
+                self.engine.horizontal_walls[r, c] = True
+            else:
+                self.engine.vertical_walls[r, c] = True
+            new_p1_dist = self.engine.get_bfs_distance(self.engine.p1_pos, 0)
+            new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, 8)
+            if orientation == "H":
+                self.engine.horizontal_walls[r, c] = False
+            else:
+                self.engine.vertical_walls[r, c] = False
+
+            p1_delta = new_p1_dist - prev_p1_dist
+            p2_delta = new_p2_dist - prev_p2_dist
+            score = p1_delta * 0.95 - max(0, p2_delta) * 0.55
+            if prev_p1_dist <= 4:
+                score += p1_delta * 0.30
+            if p1_delta <= 0:
+                score -= 0.15
+
+            if score > best_score:
+                best_score = score
+                best = (r, c, orientation)
+
+        return best
+
     def _opponent_step(self):
         if self.opponent_policy == "none":
             return False
         if self.opponent_policy != "greedy":
             raise ValueError(f"Unknown opponent_policy={self.opponent_policy!r}")
+
+        wall_probability = self.opponent_wall_probability
+        if self.engine.get_bfs_distance(self.engine.p1_pos, 0) <= 4:
+            wall_probability = max(wall_probability, min(0.75, wall_probability + 0.25))
+
+        if wall_probability > 0 and self.np_random.random() < wall_probability:
+            wall = self._choose_greedy_opponent_wall()
+            if wall is not None:
+                r, c, orientation = wall
+                if self.engine.place_wall(2, r, c, orientation):
+                    return True
 
         move = self._choose_greedy_opponent_move()
         if move is None:
@@ -383,8 +444,6 @@ class QuoridorEnv(gym.Env):
             reward += self._repeat_penalty(new_pos)
 
             if self.defensive_wall_reward and prev_p2_dist <= 3 and self.engine.walls_left[1] > 0 and new_p1_dist > 0:
-                # In defensive curriculum, moving while the opponent is about to finish
-                # should be costly unless the move wins immediately.
                 reward -= 0.55 + (3 - prev_p2_dist) * 0.20
 
             self.position_history.append(new_pos)
