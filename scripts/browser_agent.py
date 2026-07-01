@@ -25,13 +25,31 @@ MOVE_DELTAS = {
 }
 
 
+def load_maskable_model(model_path: Path, env: QuoridorEnv):
+    """Load old checkpoints even if only Box bounds changed.
+
+    Older checkpoints were saved with Box(-1, 2, (9, 9, 3), int8). The env shape
+    stayed the same, but the bounds were corrected to Box(0, 10, ...). SB3 checks
+    the full space object on load, so we override the saved metadata.
+    """
+    return MaskablePPO.load(
+        str(model_path),
+        env=env,
+        device="cpu",
+        custom_objects={
+            "observation_space": env.observation_space,
+            "action_space": env.action_space,
+        },
+    )
+
+
 class BrowserAgent:
     def __init__(self):
         self.local_env = QuoridorEnv()
         self.obs, _ = self.local_env.reset()
 
         if MODEL_PATH.exists():
-            self.model = MaskablePPO.load(str(MODEL_PATH), env=self.local_env, device="cpu")
+            self.model = load_maskable_model(MODEL_PATH, self.local_env)
             print(f"[System] Модель загружена: {MODEL_PATH}")
         else:
             self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
