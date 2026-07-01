@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.monitor import Monitor
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 
@@ -12,19 +13,28 @@ if str(ROOT_DIR) not in sys.path:
 
 from envs.quoridor.quoridor_env import QuoridorEnv
 
-# Stage 1 curriculum: teach pathing around random walls before enabling wall placement.
-RANDOM_WALLS_RANGE = (0, 8)
+# Stage 2 curriculum: random walls + moving opponent.
+# The agent still learns movement only; wall placement comes after it can race reliably.
+RANDOM_WALLS_RANGE = (0, 6)
 MOVE_ONLY = True
 REPEAT_PENALTY = True
+OPPONENT_POLICY = "greedy"
+OPPONENT_RANDOMNESS = 0.10
+
+
+def make_quoridor_env():
+    return QuoridorEnv(
+        random_walls_range=RANDOM_WALLS_RANGE,
+        move_only=MOVE_ONLY,
+        repeat_penalty=REPEAT_PENALTY,
+        opponent_policy=OPPONENT_POLICY,
+        opponent_randomness=OPPONENT_RANDOMNESS,
+    )
 
 
 def make_env(rank: int, seed: int = 0):
     def _init():
-        env = QuoridorEnv(
-            random_walls_range=RANDOM_WALLS_RANGE,
-            move_only=MOVE_ONLY,
-            repeat_penalty=REPEAT_PENALTY,
-        )
+        env = make_quoridor_env()
         env.reset(seed=seed + rank)
         return env
 
@@ -32,11 +42,7 @@ def make_env(rank: int, seed: int = 0):
 
 
 def make_eval_env():
-    return QuoridorEnv(
-        random_walls_range=RANDOM_WALLS_RANGE,
-        move_only=MOVE_ONLY,
-        repeat_penalty=REPEAT_PENALTY,
-    )
+    return Monitor(make_quoridor_env())
 
 
 def load_maskable_model(model_path: Path, env):
@@ -56,8 +62,10 @@ def main():
     num_envs = max(1, min(8, os.cpu_count() or 1))
     print(f"Инициализация {num_envs} параллельных сред...")
     print(
-        f"Curriculum: random_walls={RANDOM_WALLS_RANGE}, "
-        f"move_only={MOVE_ONLY}, repeat_penalty={REPEAT_PENALTY}"
+        "Curriculum: "
+        f"random_walls={RANDOM_WALLS_RANGE}, "
+        f"move_only={MOVE_ONLY}, repeat_penalty={REPEAT_PENALTY}, "
+        f"opponent={OPPONENT_POLICY}, opponent_randomness={OPPONENT_RANDOMNESS}"
     )
 
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)], start_method="spawn")
@@ -73,17 +81,18 @@ def main():
         eval_env,
         best_model_save_path=str(save_path),
         log_path=str(log_path),
-        eval_freq=max(1, 12_000 // num_envs),
+        eval_freq=max(1, 50_000 // num_envs),
+        n_eval_episodes=30,
         deterministic=True,
         render=False,
     )
 
     if model_path.exists():
-        backup_path = save_path / "base_before_random_walls.zip"
+        backup_path = save_path / "base_before_greedy_opponent.zip"
         if not backup_path.exists():
             backup_path.write_bytes(model_path.read_bytes())
             print(f"Сохранил backup старой модели: {backup_path}")
-        print("Найдена существующая модель. Продолжаем обучение на random walls...")
+        print("Найдена существующая модель. Продолжаем обучение против greedy opponent...")
         model = load_maskable_model(model_path, vec_env)
     else:
         print("Начинаем обучение с нуля...")
@@ -99,12 +108,15 @@ def main():
 
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
-        model.learn(total_timesteps=3_000_000, callback=eval_callback, progress_bar=True)
+        model.learn(total_timesteps=3_000_000, callback=eval_callback, progress_bar=False)
     except KeyboardInterrupt:
         print("\nОбучение прервано пользователем. Сохраняем прогресс...")
         model.save(str(model_path))
     finally:
-        vec_env.close()
+        try:
+            vec_env.close()
+        except EOFError:
+            pass
         eval_env.close()
 
 
