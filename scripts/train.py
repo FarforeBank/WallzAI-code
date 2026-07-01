@@ -36,6 +36,7 @@ STAGES = {
         "wall_candidate_limit": 0,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.0,
         "timesteps": 500_000,
         "n_eval_episodes": 30,
         "description": "learn clean pathing to the finish with no moving opponent and no maze noise",
@@ -52,6 +53,7 @@ STAGES = {
         "wall_candidate_limit": 0,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.0,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "learn BFS-map navigation through random wall mazes without opponent pressure",
@@ -68,6 +70,7 @@ STAGES = {
         "wall_candidate_limit": 0,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.0,
         "timesteps": 1_500_000,
         "n_eval_episodes": 50,
         "description": "add a moving opponent and refine racing, jumps and diagonals",
@@ -84,6 +87,7 @@ STAGES = {
         "wall_candidate_limit": 24,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.05,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "start learning useful wall placement with a compact candidate mask",
@@ -97,12 +101,13 @@ STAGES = {
         "opponent_policy": "greedy",
         "opponent_randomness": 0.25,
         "wall_reward": True,
-        "wall_candidate_limit": 40,
+        "wall_candidate_limit": 36,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.15,
         "timesteps": 3_000_000,
         "n_eval_episodes": 60,
-        "description": "full smart model: harder mazes, walls, traps and noisy opponent",
+        "description": "full smart model: harder mazes, both players can wall, traps and noisy opponent",
     },
     "6": {
         "name": "empty-board-wall-specialist",
@@ -116,6 +121,7 @@ STAGES = {
         "wall_candidate_limit": 32,
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
+        "opponent_wall_probability": 0.20,
         "timesteps": 2_500_000,
         "n_eval_episodes": 60,
         "description": "separate specialist model: starts from an empty board and learns its own wall strategy",
@@ -129,18 +135,34 @@ STAGES = {
         "opponent_policy": "greedy",
         "opponent_randomness": 0.10,
         "wall_reward": True,
-        "wall_candidate_limit": 64,
+        "wall_candidate_limit": 40,
         "opponent_start_advantage_range": (1, 3),
         "defensive_wall_reward": True,
+        "opponent_wall_probability": 0.30,
         "timesteps": 1_500_000,
         "n_eval_episodes": 70,
-        "description": "fine-tune current model to defend when the opponent has tempo and is close to winning",
+        "description": "fine-tune current model to defend when the opponent has tempo, walls, and is close to winning",
     },
 }
 
 CURRENT_STAGE = None
 SHOW_PROGRESS_BAR = True
 SMART_OBSERVATION = True
+MODEL_DEVICE = "cpu"
+
+
+def resolve_device(requested: str) -> str:
+    requested = requested.lower()
+    if requested == "auto":
+        # Env/BFS is the bottleneck, so CPU is often still faster for this small MLP.
+        # But on Apple Silicon we allow MPS when explicitly requested.
+        return "cpu"
+    if requested == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        print("[Предупреждение] MPS недоступен, использую CPU.")
+        return "cpu"
+    return requested
 
 
 def parse_args():
@@ -165,6 +187,24 @@ def parse_args():
         default=None,
         help="Override stage default timesteps.",
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=None,
+        help="Number of parallel env processes. Try 12, 16, 20, 24 on M4 Pro.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "mps", "auto"],
+        default="cpu",
+        help="Torch device. CPU is usually faster here because env/BFS dominates; test mps manually.",
+    )
+    parser.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help="Torch CPU threads. Keep low with many SubprocVecEnv workers to avoid oversubscription.",
+    )
     return parser.parse_args()
 
 
@@ -181,6 +221,7 @@ def make_quoridor_env():
         wall_candidate_limit=cfg["wall_candidate_limit"],
         opponent_start_advantage_range=cfg["opponent_start_advantage_range"],
         defensive_wall_reward=cfg["defensive_wall_reward"],
+        opponent_wall_probability=cfg["opponent_wall_probability"],
     )
 
 
@@ -202,7 +243,7 @@ def load_maskable_model(model_path: Path, env):
     return MaskablePPO.load(
         str(model_path),
         env=env,
-        device="cpu",
+        device=MODEL_DEVICE,
         custom_objects={
             "observation_space": env.observation_space,
             "action_space": env.action_space,
@@ -220,7 +261,7 @@ def create_new_model(vec_env):
         "MlpPolicy",
         vec_env,
         verbose=1,
-        device="cpu",
+        device=MODEL_DEVICE,
         learning_rate=5e-5,
         n_steps=1024,
         batch_size=512,
@@ -242,14 +283,22 @@ def backup_existing_model(model_path: Path, save_path: Path, label: str):
 
 
 def main():
-    global CURRENT_STAGE
+    global CURRENT_STAGE, MODEL_DEVICE
 
     args = parse_args()
     CURRENT_STAGE = STAGES[args.stage]
     timesteps = args.timesteps or CURRENT_STAGE["timesteps"]
+    MODEL_DEVICE = resolve_device(args.device)
+    torch.set_num_threads(max(1, int(args.torch_threads)))
 
-    num_envs = max(1, min(16, os.cpu_count() or 1))
+    detected_cpus = os.cpu_count() or 1
+    if args.num_envs is None:
+        num_envs = max(1, min(20, detected_cpus))
+    else:
+        num_envs = max(1, int(args.num_envs))
+
     print(f"Инициализация {num_envs} параллельных сред...")
+    print(f"Torch device={MODEL_DEVICE}, torch_threads={torch.get_num_threads()}, detected_cpus={detected_cpus}")
     print(f"Stage {args.stage}: {CURRENT_STAGE['name']}")
     print(CURRENT_STAGE["description"])
     print(
@@ -259,6 +308,7 @@ def main():
         f"move_only={CURRENT_STAGE['move_only']}, repeat_penalty={CURRENT_STAGE['repeat_penalty']}, "
         f"opponent={CURRENT_STAGE['opponent_policy']}, opponent_randomness={CURRENT_STAGE['opponent_randomness']}, "
         f"opponent_start_advantage={CURRENT_STAGE['opponent_start_advantage_range']}, "
+        f"opponent_wall_probability={CURRENT_STAGE['opponent_wall_probability']}, "
         f"wall_candidate_limit={CURRENT_STAGE['wall_candidate_limit']}, "
         f"smart_observation={SMART_OBSERVATION}, wall_reward={CURRENT_STAGE['wall_reward']}, "
         f"defensive_wall_reward={CURRENT_STAGE['defensive_wall_reward']}, "
