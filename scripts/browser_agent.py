@@ -1,77 +1,121 @@
-# scripts/browser_agent.py
-import time
 import os
 import sys
+import time
+from pathlib import Path
 
-BASE_DIR = os.getcwd()
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from sb3_contrib import MaskablePPO
+
 from envs.quoridor.quoridor_env import QuoridorEnv
 
-PROFILE_DIR = os.path.join(BASE_DIR, "browser_profile")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model", "best_model.zip")
+PROFILE_DIR = ROOT_DIR / "browser_profile"
+MODEL_PATH = ROOT_DIR / "models" / "best_model" / "best_model.zip"
+WALLZ_URL = "https://wallz.gg/"
+
+MOVE_DELTAS = {
+    0: (0, -1),   # Up
+    1: (0, 1),    # Down
+    2: (-1, 0),   # Left
+    3: (1, 0),    # Right
+}
+
 
 class BrowserAgent:
     def __init__(self):
         self.local_env = QuoridorEnv()
         self.obs, _ = self.local_env.reset()
-        self.model = MaskablePPO.load(MODEL_PATH) if os.path.exists(MODEL_PATH) else MaskablePPO("MlpPolicy", self.local_env)
+
+        if MODEL_PATH.exists():
+            self.model = MaskablePPO.load(str(MODEL_PATH), env=self.local_env, device="cpu")
+            print(f"[System] Модель загружена: {MODEL_PATH}")
+        else:
+            self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
+            print("[System] Модель не найдена, используются случайные веса.")
 
     def run(self):
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(user_data_dir=PROFILE_DIR, headless=False, slow_mo=200)
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+                slow_mo=200,
+            )
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto("https://wallz.gg/")
-            
-            print("\n[Управление] Начни матч и нажми ENTER, когда увидишь доску...")
-            input()
-            
-            # ИСПОЛЬЗУЕМ КЛАССЫ, А НЕ СТРОГИЙ VIEWBOX
+            page.goto(WALLZ_URL, wait_until="domcontentloaded")
+
+            input("\n[Управление] Начни матч и нажми ENTER, когда увидишь доску...")
+
             board = page.locator(".w-full.h-full").first
-            
-            while True:
-                try:
-                    # Сканируем фишки
-                    chips = board.locator("circle")
-                    if chips.count() < 2: continue # Ждем обоих игроков
-                    
-                    # Берем P1
-                    cx = float(chips.nth(0).get_attribute("cx"))
-                    cy = float(chips.nth(0).get_attribute("cy"))
-                    
-                    # ПРЕДСКАЗАНИЕ
-                    masks = self.local_env.action_masks()
-                    masks[4:] = 0 # ТОЛЬКО ХОДЬБА для теста
-                    action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
-                    
-                    # КЛИК
-                    svg_box = board.bounding_box()
-                    scale = svg_box["width"] / 660.0
-                    
-                    # Расчет целевой точки
-                    target_x, target_y = cx, cy
-                    step = 73.33
-                    if action == 0: target_y -= step
-                    elif action == 1: target_y += step
-                    elif action == 2: target_x -= step
-                    elif action == 3: target_x += step
-                    
-                    click_x = (target_x + 12) * scale
-                    click_y = (target_y + 12) * scale
-                    
-                    print(f"[Действие] Ход {int(action)} | Клик: ({click_x:.1f}, {click_y:.1f})")
-                    board.click(position={"x": click_x, "y": click_y}, force=True)
-                    
-                    # ВАЖНО: обновляем состояние среды, чтобы бот видел, что он сходил
-                    self.obs, _, _, _, _ = self.local_env.step(action)
-                    time.sleep(2)
-                    
-                except Exception as e:
-                    print(f"Поиск... {e}")
+            try:
+                board.wait_for(state="visible", timeout=40_000)
+            except PlaywrightTimeoutError:
+                print("[Ошибка] Доска не найдена. Проверь, что матч запущен.")
+                context.close()
+                return
+
+            try:
+                self._play_loop(board)
+            finally:
+                context.close()
+
+    def _play_loop(self, board):
+        while True:
+            try:
+                chips = board.locator("circle")
+                if chips.count() < 2:
+                    time.sleep(0.5)
+                    continue
+
+                cx_raw = chips.nth(0).get_attribute("cx")
+                cy_raw = chips.nth(0).get_attribute("cy")
+                if cx_raw is None or cy_raw is None:
+                    time.sleep(0.5)
+                    continue
+
+                cx = float(cx_raw)
+                cy = float(cy_raw)
+
+                masks = self.local_env.action_masks()
+                masks[4:] = False  # test mode: move only, no walls
+                action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
+                action = int(action)
+
+                if action not in MOVE_DELTAS:
+                    print(f"[Пропуск] Модель выбрала не-ход: {action}")
                     time.sleep(1)
+                    continue
+
+                svg_box = board.bounding_box()
+                if svg_box is None:
+                    time.sleep(0.5)
+                    continue
+
+                dx, dy = MOVE_DELTAS[action]
+                board_units = 660.0
+                cell_step = board_units / 9.0
+                scale = svg_box["width"] / board_units
+                target_x = (cx + dx * cell_step) * scale
+                target_y = (cy + dy * cell_step) * scale
+
+                print(f"[Действие] Ход {action} | Клик: ({target_x:.1f}, {target_y:.1f})")
+                board.click(position={"x": target_x, "y": target_y}, force=True)
+
+                self.obs, _, terminated, truncated, _ = self.local_env.step(action)
+                if terminated or truncated:
+                    self.obs, _ = self.local_env.reset()
+
+                time.sleep(2)
+            except KeyboardInterrupt:
+                print("\n[System] Остановлено пользователем.")
+                break
+            except Exception as e:
+                print(f"[Поиск] {e}")
+                time.sleep(1)
+
 
 if __name__ == "__main__":
     BrowserAgent().run()
