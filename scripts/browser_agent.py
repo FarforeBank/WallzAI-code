@@ -61,7 +61,6 @@ def action_name(action: int) -> str:
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
-    """Load checkpoints only when compatible with the current action space."""
     return MaskablePPO.load(
         str(model_path),
         env=env,
@@ -84,7 +83,6 @@ def _looks_teal(item: dict) -> bool:
     text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
     if any(token in text for token in ("cyan", "teal", "turquoise", "emerald")):
         return True
-
     for key in ("fill", "stroke"):
         rgb = _rgb(item.get(key, ""))
         if rgb is None:
@@ -99,7 +97,6 @@ def _looks_red(item: dict) -> bool:
     text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
     if any(token in text for token in ("pink", "rose", "red", "crimson", "salmon")):
         return True
-
     for key in ("fill", "stroke"):
         rgb = _rgb(item.get(key, ""))
         if rgb is None:
@@ -121,7 +118,6 @@ def _pawn_color_key(item: dict) -> str:
 def _cluster_axis(values, expected=9):
     if not values:
         return []
-
     values = sorted(values)
     if len(values) <= expected:
         return values
@@ -130,7 +126,6 @@ def _cluster_axis(values, expected=9):
     threshold = max(8.0, span / 80.0)
     clusters = []
     current = [values[0]]
-
     for value in values[1:]:
         if abs(value - current[-1]) <= threshold:
             current.append(value)
@@ -151,7 +146,6 @@ def _cluster_axis(values, expected=9):
                 best = candidate
                 best_score = score
         clusters = best
-
     return clusters
 
 
@@ -186,13 +180,14 @@ def _clean_float(value):
 
 class BrowserAgent:
     def __init__(self):
-        # Browser play should use the same smart observation / wall-capable env as Stage 5.
+        # Browser play uses the same smart observation / wall-capable env as Stage 5.
         self.local_env = QuoridorEnv(wall_candidate_limit=40)
         self.obs, _ = self.local_env.reset()
         self.position_history = []
         self.own_color_key = None
         self.last_own_screen_xy = None
         self.wall_debug = ""
+        self.last_ui_walls_left = 10
 
         if MODEL_PATH.exists():
             try:
@@ -292,6 +287,39 @@ class BrowserAgent:
             """
         )
 
+    def _sync_walls_left_from_page(self, page):
+        """Read the user's remaining wall count from the Wallz sidebar.
+
+        The board SVG tells us which walls exist, but not how many of them are ours.
+        Without this, the local env keeps walls_left=10 forever and still offers
+        wall actions after the website shows WALLS · 0.
+        """
+        try:
+            value = page.evaluate(
+                """
+                () => {
+                    const text = document.body.innerText || '';
+                    const lower = text.toLowerCase();
+                    const youIndex = lower.indexOf('you');
+                    if (youIndex >= 0) {
+                        const chunk = text.slice(youIndex, youIndex + 350);
+                        const match = chunk.match(/WALLS\s*[·:.\-]?\s*(\d+)/i);
+                        if (match) return Number(match[1]);
+                    }
+                    const matches = [...text.matchAll(/WALLS\s*[·:.\-]?\s*(\d+)/gi)].map((m) => Number(m[1]));
+                    if (matches.length) return matches[matches.length - 1];
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return
+
+        if isinstance(value, (int, float)) and np.isfinite(value):
+            value = int(max(0, min(10, value)))
+            self.last_ui_walls_left = value
+            self.local_env.engine.walls_left[1] = value
+
     def _cell_centers(self, state):
         square_rects = []
         for rect in state["shapes"]:
@@ -339,9 +367,6 @@ class BrowserAgent:
         if raw_x is None or raw_y is None or raw_w is None or raw_h is None:
             return None
 
-        # Wallz renders placed walls directly in board SVG coordinates:
-        # vertical:   x=<boundary-6>, y=<top cell y>, width=12, height=132
-        # horizontal: x=<left cell x>, y=<boundary-6>, width=132, height=12
         is_horizontal = abs(raw_w - 132) <= 18 and abs(raw_h - 12) <= 8
         is_vertical = abs(raw_w - 12) <= 8 and abs(raw_h - 132) <= 18
         if not is_horizontal and not is_vertical:
@@ -363,7 +388,6 @@ class BrowserAgent:
     def _is_wall_bar(self, item, centers):
         if item.get("tag") == "circle":
             return None
-
         xs, ys = centers
         if len(xs) < 2 or len(ys) < 2:
             return None
@@ -373,24 +397,15 @@ class BrowserAgent:
         long_side = max(w, h)
         short_side = min(w, h)
         ratio = long_side / max(1.0, short_side)
-
         squareish = 0.65 <= (w / h if h else 0) <= 1.55
         if squareish and w >= gap * 0.45 and h >= gap * 0.45:
             return None
-
-        if ratio < 1.7:
-            return None
-        if short_side > gap * 0.72:
-            return None
-        if long_side < gap * 0.38:
-            return None
-        if long_side > gap * 3.5:
+        if ratio < 1.7 or short_side > gap * 0.72 or long_side < gap * 0.38 or long_side > gap * 3.5:
             return None
 
         color_text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
         if "transparent" in color_text or "none none" in color_text:
             return None
-
         return "H" if w >= h else "V"
 
     def _sync_walls_from_screen(self, state, centers):
@@ -439,9 +454,6 @@ class BrowserAgent:
             lx, ly = self.last_own_screen_xy
             return abs(circle["x"] - lx) + abs(circle["y"] - ly)
 
-        # First bind: in this setup the user starts from the bottom side.
-        # After that, track by the pawn's color so we do not swap identity when
-        # the opponent moves below/near us.
         if self.own_color_key is None:
             own = max(pawns, key=lambda circle: (circle["y"], circle["r"]))
             self.own_color_key = _pawn_color_key(own)
@@ -455,17 +467,15 @@ class BrowserAgent:
 
         self.last_own_screen_xy = (own["x"], own["y"])
         opponent_candidates = [circle for circle in pawns if circle is not own]
-        if self.last_own_screen_xy:
-            opponent = max(opponent_candidates, key=lambda circle: distance_to_last(circle)) if opponent_candidates else None
-        else:
-            opponent = min(opponent_candidates, key=lambda circle: (circle["y"], -circle["r"])) if opponent_candidates else None
-
+        opponent = max(opponent_candidates, key=lambda circle: distance_to_last(circle)) if opponent_candidates else None
         return own, opponent
 
     def _reset_identity(self):
         self.position_history.clear()
         self.own_color_key = None
         self.last_own_screen_xy = None
+        self.local_env.engine.walls_left[1] = 10
+        self.last_ui_walls_left = 10
 
     def _sync_env_from_screen(self, own, opponent, state, centers):
         p1_pos = self._grid_pos(own, centers)
@@ -485,13 +495,9 @@ class BrowserAgent:
         own_pos = self._grid_pos(own, centers)
         own_radius = own["r"]
         options = {}
-
         for circle in state["circles"]:
-            if circle is own:
+            if circle is own or circle["r"] >= own_radius * 0.75:
                 continue
-            if circle["r"] >= own_radius * 0.75:
-                continue
-
             dot_pos = self._grid_pos(circle, centers)
             delta = (dot_pos[0] - own_pos[0], dot_pos[1] - own_pos[1])
             action = ACTION_BY_DELTA.get(delta)
@@ -505,7 +511,6 @@ class BrowserAgent:
                 target_pos = (own_pos[0] + dx, own_pos[1] + dy)
                 if target_pos in valid_moves and action not in options:
                     options[action] = self._cell_point(target_pos, centers)
-
         return options
 
     def _wall_click_point(self, action, centers):
@@ -516,7 +521,6 @@ class BrowserAgent:
         if H_WALL_OFFSET <= action < V_WALL_OFFSET:
             idx = action - H_WALL_OFFSET
             r, c = divmod(idx, 8)
-            # Avoid the exact H/V crossing center; click inside the horizontal bar.
             gap_x = xs[c + 1] - xs[c]
             x = xs[c] + gap_x * 0.25
             y = (ys[r] + ys[r + 1]) / 2.0
@@ -525,18 +529,15 @@ class BrowserAgent:
         if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
             idx = action - V_WALL_OFFSET
             r, c = divmod(idx, 8)
-            # Avoid the exact H/V crossing center; click inside the vertical bar.
             gap_y = ys[r + 1] - ys[r]
             x = (xs[c] + xs[c + 1]) / 2.0
             y = ys[r] + gap_y * 0.25
             return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "V", "wall_rc": (r, c)}
-
         return None
 
     def _wall_action_options(self, centers):
-        if not ALLOW_WALL_ACTIONS:
+        if not ALLOW_WALL_ACTIONS or self.local_env.engine.walls_left[1] <= 0:
             return {}
-
         masks = self.local_env.action_masks()
         options = {}
         for action in range(MOVE_ACTIONS, TOTAL_ACTIONS):
@@ -557,8 +558,6 @@ class BrowserAgent:
         return p1_pos[0] + dx, p1_pos[1] + dy
 
     def _choose_action(self, predicted_action, action_options, p1_pos):
-        # Cycle guard is only for pawn moves. Wall actions are already legal and
-        # should not be overridden by a movement anti-loop rule.
         if predicted_action >= MOVE_ACTIONS:
             return predicted_action, False
         if not CYCLE_GUARD or predicted_action not in action_options:
@@ -567,8 +566,6 @@ class BrowserAgent:
         predicted_pos = self._target_pos_for_action(p1_pos, predicted_action)
         current_dist = self.local_env.engine.get_bfs_distance(p1_pos, 0)
         predicted_dist = self.local_env.engine.get_bfs_distance(predicted_pos, 0)
-
-        # Never override a move that really gets us closer to the finish.
         if predicted_dist < current_dist:
             return predicted_action, False
 
@@ -594,7 +591,7 @@ class BrowserAgent:
 
     def _walls_text(self, wall_counts):
         debug = f" | {self.wall_debug}" if DEBUG_WALLS and self.wall_debug else ""
-        return f"walls H/V={wall_counts}{debug}"
+        return f"walls H/V={wall_counts} left={self.local_env.engine.walls_left[1]}{debug}"
 
     def _play_loop(self, page, board):
         while True:
@@ -613,6 +610,7 @@ class BrowserAgent:
                     continue
 
                 p1_pos, p2_pos, wall_counts = self._sync_env_from_screen(own, opponent, state, centers)
+                self._sync_walls_left_from_page(page)
                 walls_text = self._walls_text(wall_counts)
                 if p1_pos[1] == 0 or p2_pos[1] == 8:
                     print(f"[Ожидание] Матч, похоже, завершён | P1={p1_pos} P2={p2_pos} | {walls_text}")
@@ -642,7 +640,6 @@ class BrowserAgent:
 
                 source = "synthetic" if target.get("synthetic") else target.get("kind", "screen")
                 guard = f" | guard {action_name(predicted_action)}->{action_name(action)}" if overridden else ""
-
                 if action < MOVE_ACTIONS:
                     target_pos = self._target_pos_for_action(p1_pos, action)
                     print(
@@ -659,7 +656,6 @@ class BrowserAgent:
 
                 page.mouse.move(target["x"], target["y"])
                 page.mouse.click(target["x"], target["y"])
-
                 if action < MOVE_ACTIONS:
                     self.position_history.append(self._target_pos_for_action(p1_pos, action))
                     self.position_history = self.position_history[-12:]
