@@ -16,8 +16,6 @@ MODEL_ALIASES = {
 _original_svg_wall_from_item = browser_agent_module.BrowserAgent._svg_wall_from_item
 _original_sync_walls_from_screen = browser_agent_module.BrowserAgent._sync_walls_from_screen
 WALL_FAILURE_LIMIT = 3
-FINISH_GUARD_DISTANCE = 4
-EMERGENCY_OPPONENT_DISTANCE = 2
 
 
 def resolve_model_path(value: str) -> Path:
@@ -200,110 +198,6 @@ def drag_wall_from_tray(page, board, orientation, target):
         _manual_drag_wall_from_tray(page, orientation, target)
 
 
-def _best_progress_move(self, action_options, p1_pos):
-    move_actions = [action for action in action_options if action < browser_agent_module.MOVE_ACTIONS]
-    if not move_actions:
-        return None
-
-    current_dist = self.local_env.engine.get_bfs_distance(p1_pos, 0)
-    recent = set(self.position_history[-4:])
-
-    def score(action):
-        target_pos = self._target_pos_for_action(p1_pos, action)
-        dist = self.local_env.engine.get_bfs_distance(target_pos, 0)
-        repeat = 1.75 if target_pos in recent else 0.0
-        side = abs(target_pos[0] - 4) * 0.03
-        return dist + repeat + side
-
-    improving = [
-        action for action in move_actions
-        if self.local_env.engine.get_bfs_distance(self._target_pos_for_action(p1_pos, action), 0) < current_dist
-    ]
-    candidates = improving or move_actions
-    return min(candidates, key=score)
-
-
-def _wall_score(self, action):
-    parts = browser_agent_module._wall_action_parts(action)
-    if parts is None:
-        return None
-
-    r, c, orientation = parts
-    engine = self.local_env.engine
-    if not engine.can_place_wall(1, r, c, orientation):
-        return None
-
-    prev_p1_dist = engine.get_bfs_distance(engine.p1_pos, 0)
-    prev_p2_dist = engine.get_bfs_distance(engine.p2_pos, 8)
-
-    if orientation == "H":
-        engine.horizontal_walls[r, c] = True
-    else:
-        engine.vertical_walls[r, c] = True
-    new_p1_dist = engine.get_bfs_distance(engine.p1_pos, 0)
-    new_p2_dist = engine.get_bfs_distance(engine.p2_pos, 8)
-    if orientation == "H":
-        engine.horizontal_walls[r, c] = False
-    else:
-        engine.vertical_walls[r, c] = False
-
-    if new_p1_dist >= 999 or new_p2_dist >= 999:
-        return None
-
-    opponent_delta = new_p2_dist - prev_p2_dist
-    own_delta = new_p1_dist - prev_p1_dist
-    score = opponent_delta * 1.25 - max(0, own_delta) * 0.65
-    if prev_p2_dist <= 2 and opponent_delta > 0:
-        score += 0.75
-    return score, opponent_delta, own_delta
-
-
-def _best_emergency_wall(self, action_options):
-    wall_actions = [action for action in action_options if action >= browser_agent_module.MOVE_ACTIONS]
-    best_action = None
-    best_score = -999.0
-    best_detail = None
-
-    for action in wall_actions:
-        scored = _wall_score(self, action)
-        if scored is None:
-            continue
-        score, opponent_delta, own_delta = scored
-        if opponent_delta <= 0:
-            continue
-        if score > best_score:
-            best_score = score
-            best_action = action
-            best_detail = (opponent_delta, own_delta, score)
-
-    return best_action, best_detail
-
-
-def safe_choose_action(self, predicted_action, action_options, p1_pos, p2_pos):
-    engine = self.local_env.engine
-    p1_dist = engine.get_bfs_distance(p1_pos, 0)
-    p2_dist = engine.get_bfs_distance(p2_pos, 8)
-
-    # If the opponent is one move from winning, trust a scored wall more than the model.
-    if p2_dist <= EMERGENCY_OPPONENT_DISTANCE and engine.walls_left[1] > 0:
-        emergency_wall, detail = _best_emergency_wall(self, action_options)
-        if emergency_wall is not None:
-            return emergency_wall, emergency_wall != predicted_action, f"emergency_wall p2dist={p2_dist} detail={detail}"
-
-    # The Stage 7 policy likes walls. Near the finish this often throws winning races.
-    # If a wall is not urgently defensive, prefer a move that reduces our BFS distance.
-    if predicted_action >= browser_agent_module.MOVE_ACTIONS and p1_dist <= FINISH_GUARD_DISTANCE:
-        progress_move = _best_progress_move(self, action_options, p1_pos)
-        if progress_move is not None:
-            return progress_move, progress_move != predicted_action, f"finish_guard p1dist={p1_dist} p2dist={p2_dist}"
-
-    if predicted_action < browser_agent_module.MOVE_ACTIONS:
-        action, overridden = self._choose_action(predicted_action, action_options, p1_pos)
-        return action, overridden, "cycle_guard" if overridden else ""
-
-    return predicted_action, False, ""
-
-
 def safe_play_loop(self, page, board):
     while True:
         try:
@@ -341,7 +235,7 @@ def safe_play_loop(self, page, board):
 
             predicted_action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
             predicted_action = int(predicted_action)
-            action, overridden, reason = safe_choose_action(self, predicted_action, action_options, p1_pos, p2_pos)
+            action, overridden = self._choose_action(predicted_action, action_options, p1_pos)
 
             target = action_options.get(action)
             if target is None:
@@ -350,7 +244,7 @@ def safe_play_loop(self, page, board):
                 continue
 
             source = "synthetic" if target.get("synthetic") else target.get("kind", "screen")
-            guard = f" | guard {browser_agent_module.action_name(predicted_action)}->{browser_agent_module.action_name(action)} {reason}" if overridden else ""
+            guard = f" | guard {browser_agent_module.action_name(predicted_action)}->{browser_agent_module.action_name(action)}" if overridden else ""
 
             old_wall_total = wall_counts[0] + wall_counts[1]
             if action < browser_agent_module.MOVE_ACTIONS:
@@ -400,7 +294,7 @@ def install_safe_wall_patches():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run Wallz browser agent with tray drag wall actions, exact verification, and race guards.")
+    parser = argparse.ArgumentParser(description="Run Wallz browser agent with tray drag wall actions and exact verification.")
     parser.add_argument(
         "--model",
         default="best",
@@ -421,7 +315,7 @@ def main():
     browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: direct wall drag targets + emergency wall guard + finish guard")
+    print("[System] Safe wall mode: direct wall drag targets, no strategic guards")
     if args.no_walls:
         print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
