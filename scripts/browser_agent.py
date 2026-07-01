@@ -4,6 +4,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -96,7 +98,6 @@ def _cluster_axis(values, expected=9):
     clusters.append(sum(current) / len(current))
 
     if len(clusters) > expected:
-        # Pick the most regular 9 centers by taking the widest board-like span.
         best = None
         best_score = None
         for start in range(0, len(clusters) - expected + 1):
@@ -116,6 +117,17 @@ def _nearest_index(value, centers):
     if not centers:
         return 0
     return min(range(len(centers)), key=lambda i: abs(value - centers[i]))
+
+
+def _boundaries(centers):
+    return [(centers[i] + centers[i + 1]) / 2.0 for i in range(len(centers) - 1)]
+
+
+def _median_gap(centers, default=70.0):
+    if len(centers) < 2:
+        return default
+    gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    return float(np.median(gaps))
 
 
 class BrowserAgent:
@@ -187,7 +199,7 @@ class BrowserAgent:
                         stroke: style.stroke || rectEl.getAttribute('stroke') || '',
                         className: rectEl.getAttribute('class') || '',
                     };
-                }).filter((rect) => rect.w > 10 && rect.h > 10 && Number.isFinite(rect.x) && Number.isFinite(rect.y));
+                }).filter((rect) => rect.w > 4 && rect.h > 4 && Number.isFinite(rect.x) && Number.isFinite(rect.y));
 
                 return { circles, rects };
             }
@@ -208,7 +220,6 @@ class BrowserAgent:
             if len(xs) >= 2 and len(ys) >= 2:
                 return xs[:9], ys[:9]
 
-        # Fallback: infer a board grid from all circle positions.
         xs = _cluster_axis([circle["x"] for circle in state["circles"]], expected=9)
         ys = _cluster_axis([circle["y"] for circle in state["circles"]], expected=9)
         return xs[:9], ys[:9]
@@ -216,6 +227,55 @@ class BrowserAgent:
     def _grid_pos(self, item, centers):
         xs, ys = centers
         return _nearest_index(item["x"], xs), _nearest_index(item["y"], ys)
+
+    def _wall_index(self, item, centers):
+        xs, ys = centers
+        xb = _boundaries(xs)
+        yb = _boundaries(ys)
+        c = _nearest_index(item["x"], xb)
+        r = _nearest_index(item["y"], yb)
+        return max(0, min(7, r)), max(0, min(7, c))
+
+    def _is_wall_rect(self, rect, centers):
+        xs, ys = centers
+        gap = min(_median_gap(xs), _median_gap(ys))
+        w, h = rect["w"], rect["h"]
+
+        is_vertical = h >= gap * 1.25 and h >= w * 2.2 and w <= gap * 0.45
+        is_horizontal = w >= gap * 1.25 and w >= h * 2.2 and h <= gap * 0.45
+        if not (is_vertical or is_horizontal):
+            return None
+
+        # Walls can be teal/red/gray depending on owner and history. We mostly rely on geometry,
+        # but ignore very dark background pieces by requiring a visible fill/stroke token or color.
+        color_text = f"{rect.get('fill', '')} {rect.get('stroke', '')} {rect.get('className', '')}".lower()
+        has_color = bool(color_text.strip()) and "none" not in color_text
+        if not has_color:
+            return None
+
+        return "V" if is_vertical else "H"
+
+    def _sync_walls_from_screen(self, state, centers):
+        engine = self.local_env.engine
+        engine.horizontal_walls[:, :] = False
+        engine.vertical_walls[:, :] = False
+
+        horizontal = 0
+        vertical = 0
+        for rect in state["rects"]:
+            orientation = self._is_wall_rect(rect, centers)
+            if orientation is None:
+                continue
+
+            r, c = self._wall_index(rect, centers)
+            if orientation == "H":
+                engine.horizontal_walls[r, c] = True
+                horizontal += 1
+            else:
+                engine.vertical_walls[r, c] = True
+                vertical += 1
+
+        return horizontal, vertical
 
     def _pick_pawns(self, state):
         circles = state["circles"]
@@ -231,10 +291,8 @@ class BrowserAgent:
         red_pawns = [circle for circle in pawns if _looks_red(circle)]
 
         if teal_pawns:
-            # Our pawn is the large cyan/teal pawn, not small move dots.
             own = max(teal_pawns, key=lambda circle: (circle["r"], circle["y"]))
         else:
-            # In this mode our pawn starts lower on the board.
             own = max(pawns, key=lambda circle: circle["y"])
 
         opponent_pool = [circle for circle in red_pawns if circle is not own]
@@ -246,18 +304,19 @@ class BrowserAgent:
 
         return own, opponent
 
-    def _sync_env_from_screen(self, own, opponent, centers):
+    def _sync_env_from_screen(self, own, opponent, state, centers):
         p1_pos = self._grid_pos(own, centers)
         p2_pos = self._grid_pos(opponent, centers) if opponent else self.local_env.engine.p2_pos
 
         engine = self.local_env.engine
+        wall_counts = self._sync_walls_from_screen(state, centers)
         engine.board[:, :] = 0
         engine.p1_pos = p1_pos
         engine.p2_pos = p2_pos
         engine.board[p1_pos[1], p1_pos[0]] = 1
         engine.board[p2_pos[1], p2_pos[0]] = 2
         self.obs = self.local_env._get_obs()
-        return p1_pos, p2_pos
+        return p1_pos, p2_pos, wall_counts
 
     def _screen_move_options(self, own, state, centers):
         own_pos = self._grid_pos(own, centers)
@@ -267,7 +326,6 @@ class BrowserAgent:
         for circle in state["circles"]:
             if circle is own:
                 continue
-            # Legal move dots are smaller cyan/teal circles near our pawn.
             if circle["r"] >= own_radius * 0.75:
                 continue
             if not _looks_teal(circle):
@@ -297,11 +355,11 @@ class BrowserAgent:
                     time.sleep(0.5)
                     continue
 
-                p1_pos, p2_pos = self._sync_env_from_screen(own, opponent, centers)
+                p1_pos, p2_pos, wall_counts = self._sync_env_from_screen(own, opponent, state, centers)
                 move_options = self._screen_move_options(own, state, centers)
 
                 if not move_options:
-                    print(f"[Ожидание] Нет доступных точек хода | P1={p1_pos} P2={p2_pos}")
+                    print(f"[Ожидание] Нет доступных точек хода | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
                     time.sleep(0.7)
                     continue
 
@@ -322,8 +380,8 @@ class BrowserAgent:
 
                 target_pos = self._grid_pos(target, centers)
                 print(
-                    f"[Действие] P1={p1_pos} P2={p2_pos} | ход {action} "
-                    f"-> {target_pos} | клик ({target['x']:.1f}, {target['y']:.1f})"
+                    f"[Действие] P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts} | "
+                    f"ход {action} -> {target_pos} | клик ({target['x']:.1f}, {target['y']:.1f})"
                 )
                 page.mouse.click(target["x"], target["y"])
                 time.sleep(1.2)
