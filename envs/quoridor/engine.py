@@ -128,33 +128,47 @@ class QuoridorEngine:
                         queue.append((nx, ny, dist + 1))
         return 999
 
-    def can_place_wall(self, player_id, r, c, orientation):
-        if player_id not in self.walls_left or self.walls_left[player_id] <= 0:
-            return False
+    def _wall_slot_is_free(self, r, c, orientation):
+        """Cheap structural check before expensive BFS path validation.
+
+        This explicitly prevents training/browser logic from considering wall actions
+        that repeat an occupied slot, overlap half of an existing wall, or cross an
+        existing wall. It runs before BFS so invalid repeated wall placements are
+        filtered out fast.
+        """
         if r < 0 or r > 7 or c < 0 or c > 7:
             return False
         if orientation not in {"H", "V"}:
             return False
 
-        # Overlap/crossing checks.
         if orientation == "H":
             if self.horizontal_walls[r, c]:
                 return False
+            # A horizontal wall has length 2; neighboring starts overlap by one cell.
             if c > 0 and self.horizontal_walls[r, c - 1]:
                 return False
             if c < 7 and self.horizontal_walls[r, c + 1]:
                 return False
             if self.vertical_walls[r, c]:
                 return False
-        else:
-            if self.vertical_walls[r, c]:
-                return False
-            if r > 0 and self.vertical_walls[r - 1, c]:
-                return False
-            if r < 7 and self.vertical_walls[r + 1, c]:
-                return False
-            if self.horizontal_walls[r, c]:
-                return False
+            return True
+
+        if self.vertical_walls[r, c]:
+            return False
+        # A vertical wall has length 2; neighboring starts overlap by one cell.
+        if r > 0 and self.vertical_walls[r - 1, c]:
+            return False
+        if r < 7 and self.vertical_walls[r + 1, c]:
+            return False
+        if self.horizontal_walls[r, c]:
+            return False
+        return True
+
+    def can_place_wall(self, player_id, r, c, orientation):
+        if player_id not in self.walls_left or self.walls_left[player_id] <= 0:
+            return False
+        if not self._wall_slot_is_free(r, c, orientation):
+            return False
 
         # Temporarily place the wall to ensure both players still have a path.
         if orientation == "H":
