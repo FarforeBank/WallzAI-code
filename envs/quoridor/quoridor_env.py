@@ -5,6 +5,9 @@ import numpy as np
 from envs.quoridor.engine import QuoridorEngine
 
 
+MOVES = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # Up, Down, Left, Right
+
+
 class QuoridorEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
@@ -14,6 +17,8 @@ class QuoridorEnv(gym.Env):
         random_walls_range=(0, 0),
         move_only=False,
         repeat_penalty=False,
+        opponent_policy="none",
+        opponent_randomness=0.0,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -21,6 +26,8 @@ class QuoridorEnv(gym.Env):
         self.random_walls_range = random_walls_range
         self.move_only = move_only
         self.repeat_penalty = repeat_penalty
+        self.opponent_policy = opponent_policy
+        self.opponent_randomness = float(opponent_randomness)
         self.position_history = []
 
         # 0-3: movement actions
@@ -79,8 +86,9 @@ class QuoridorEnv(gym.Env):
         obs[:8, :8, 1] = self.engine.horizontal_walls.astype(np.int8)
         obs[:8, :8, 2] = self.engine.vertical_walls.astype(np.int8)
 
-        # Give the policy a simple hint about remaining walls.
+        # Give the policy simple hints about remaining walls.
         obs[8, 0, 1] = self.engine.walls_left[1]
+        obs[8, 1, 1] = self.engine.walls_left[2]
         return obs
 
     def action_masks(self):
@@ -88,9 +96,8 @@ class QuoridorEnv(gym.Env):
 
         # 1. Movement actions
         valid_moves = self.engine.get_valid_moves(1)
-        moves = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # Up, Down, Left, Right
         cx, cy = self.engine.p1_pos
-        for i, (dx, dy) in enumerate(moves):
+        for i, (dx, dy) in enumerate(MOVES):
             if (cx + dx, cy + dy) in valid_moves:
                 mask[i] = True
 
@@ -111,16 +118,64 @@ class QuoridorEnv(gym.Env):
 
         return mask
 
+    def _move_player_to(self, player_id, target_pos):
+        if player_id == 1:
+            old_x, old_y = self.engine.p1_pos
+            self.engine.board[old_y, old_x] = 0
+            self.engine.p1_pos = target_pos
+            self.engine.board[target_pos[1], target_pos[0]] = 1
+        else:
+            old_x, old_y = self.engine.p2_pos
+            self.engine.board[old_y, old_x] = 0
+            self.engine.p2_pos = target_pos
+            self.engine.board[target_pos[1], target_pos[0]] = 2
+
     def _repeat_penalty(self, new_pos):
         if not self.repeat_penalty:
             return 0.0
 
         penalty = 0.0
         if len(self.position_history) >= 2 and new_pos == self.position_history[-2]:
-            penalty -= 0.25  # immediate backtracking
-        if new_pos in self.position_history[-6:]:
-            penalty -= 0.05  # short loop
+            penalty -= 0.45  # immediate backtracking
+        if new_pos in self.position_history[-8:]:
+            penalty -= 0.12  # short loop
         return penalty
+
+    def _choose_greedy_opponent_move(self):
+        valid_moves = self.engine.get_valid_moves(2)
+        if not valid_moves:
+            return None
+
+        if self.opponent_randomness > 0 and self.np_random.random() < self.opponent_randomness:
+            return valid_moves[int(self.np_random.integers(0, len(valid_moves)))]
+
+        cx, cy = self.engine.p2_pos
+
+        def score(pos):
+            dist = self.engine.get_bfs_distance(pos, 8)
+            dx = abs(pos[0] - 4) * 0.05
+            progress_bonus = -0.15 if pos[1] > cy else 0.0
+            return dist + dx + progress_bonus
+
+        return min(valid_moves, key=score)
+
+    def _opponent_step(self):
+        if self.opponent_policy == "none":
+            return False
+        if self.opponent_policy != "greedy":
+            raise ValueError(f"Unknown opponent_policy={self.opponent_policy!r}")
+
+        move = self._choose_greedy_opponent_move()
+        if move is None:
+            return False
+        self._move_player_to(2, move)
+        return True
+
+    def _is_p1_win(self):
+        return self.engine.p1_pos[1] == 0
+
+    def _is_p2_win(self):
+        return self.engine.p2_pos[1] == 8
 
     def step(self, action):
         action = int(action)
@@ -128,48 +183,58 @@ class QuoridorEnv(gym.Env):
             raise ValueError(f"Invalid action {action}; expected 0..{self.action_space.n - 1}")
 
         self.current_step += 1
-        target_row = 0
-        prev_pos = self.engine.p1_pos
-        prev_dist = self.engine.get_bfs_distance(prev_pos, target_row)
+        p1_target_row = 0
+        p2_target_row = 8
+        prev_p1_pos = self.engine.p1_pos
+        prev_p1_dist = self.engine.get_bfs_distance(prev_p1_pos, p1_target_row)
+        prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, p2_target_row)
         valid_action = bool(self.action_masks()[action])
 
-        if valid_action:
-            if action < 4:
-                moves = [(0, -1), (0, 1), (-1, 0), (1, 0)]
-                dx, dy = moves[action]
-                cx, cy = self.engine.p1_pos
-                self.engine.board[cy, cx] = 0
-                self.engine.p1_pos = (cx + dx, cy + dy)
-                self.engine.board[cy + dy, cx + dx] = 1
-            elif action < 68:
-                idx = action - 4
-                self.engine.place_wall(1, idx // 8, idx % 8, "H")
-            else:
-                idx = action - 68
-                self.engine.place_wall(1, idx // 8, idx % 8, "V")
-
-        new_pos = self.engine.p1_pos
-        new_dist = self.engine.get_bfs_distance(new_pos, target_row)
+        reward = -0.02  # time pressure: win quickly
 
         if not valid_action:
-            reward = -0.2
+            reward -= 1.0
         elif action < 4:
-            reward = (prev_dist - new_dist) * 0.15 - 0.01
-            reward += self._repeat_penalty(new_pos)
-        else:
-            reward = -0.01
+            dx, dy = MOVES[action]
+            cx, cy = self.engine.p1_pos
+            new_pos = (cx + dx, cy + dy)
+            self._move_player_to(1, new_pos)
+            new_p1_dist = self.engine.get_bfs_distance(new_pos, p1_target_row)
 
-        if valid_action and action < 4:
+            reward += (prev_p1_dist - new_p1_dist) * 0.30
+            reward += self._repeat_penalty(new_pos)
             self.position_history.append(new_pos)
+        elif action < 68:
+            idx = action - 4
+            if self.engine.place_wall(1, idx // 8, idx % 8, "H"):
+                reward -= 0.02
+            else:
+                reward -= 1.0
+        else:
+            idx = action - 68
+            if self.engine.place_wall(1, idx // 8, idx % 8, "V"):
+                reward -= 0.02
+            else:
+                reward -= 1.0
 
         terminated = False
-        if new_dist == 0 or self.engine.p1_pos[1] == target_row:
-            reward += 10.0
+        if self._is_p1_win():
+            reward += 12.0
             terminated = True
+
+        if not terminated:
+            moved = self._opponent_step()
+            if moved:
+                new_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, p2_target_row)
+                reward -= max(0, prev_p2_dist - new_p2_dist) * 0.10
+
+            if self._is_p2_win():
+                reward -= 12.0
+                terminated = True
 
         truncated = False
         if self.current_step >= self.max_steps and not terminated:
             truncated = True
-            reward -= 5.0
+            reward -= 6.0
 
         return self._get_obs(), reward, terminated, truncated, {}
