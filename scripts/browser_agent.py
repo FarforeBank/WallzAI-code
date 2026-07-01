@@ -46,6 +46,7 @@ CYCLE_GUARD = True
 DEBUG_WALLS = True
 USE_SYNTHETIC_MOVES = False
 ALLOW_WALL_ACTIONS = True
+USE_GEOMETRY_WALL_FALLBACK = False
 
 
 def action_name(action: int) -> str:
@@ -58,6 +59,16 @@ def action_name(action: int) -> str:
         idx = action - V_WALL_OFFSET
         return f"WALL_V_{idx // 8}_{idx % 8}"
     return f"ACTION_{action}"
+
+
+def _wall_action_parts(action: int):
+    if H_WALL_OFFSET <= action < V_WALL_OFFSET:
+        idx = action - H_WALL_OFFSET
+        return idx // 8, idx % 8, "H"
+    if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
+        idx = action - V_WALL_OFFSET
+        return idx // 8, idx % 8, "V"
+    return None
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
@@ -188,6 +199,9 @@ class BrowserAgent:
         self.last_own_screen_xy = None
         self.wall_debug = ""
         self.last_ui_walls_left = 10
+        self.screen_horizontal = set()
+        self.screen_vertical = set()
+        self.failed_wall_actions = set()
 
         if MODEL_PATH.exists():
             try:
@@ -288,12 +302,7 @@ class BrowserAgent:
         )
 
     def _sync_walls_left_from_page(self, page):
-        """Read the user's remaining wall count from the Wallz sidebar.
-
-        The board SVG tells us which walls exist, but not how many of them are ours.
-        Without this, the local env keeps walls_left=10 forever and still offers
-        wall actions after the website shows WALLS · 0.
-        """
+        """Read the user's remaining wall count from the Wallz sidebar."""
         try:
             value = page.evaluate(
                 """
@@ -419,17 +428,21 @@ class BrowserAgent:
             parsed = self._svg_wall_from_item(item)
             if parsed is not None:
                 orientation, r, c = parsed
-            else:
+            elif USE_GEOMETRY_WALL_FALLBACK:
                 orientation = self._is_wall_bar(item, centers)
                 if orientation is None:
                     continue
                 r, c = self._wall_index(item, centers)
+            else:
+                continue
 
             if orientation == "H":
                 horizontal.add((r, c))
             else:
                 vertical.add((r, c))
 
+        self.screen_horizontal = horizontal
+        self.screen_vertical = vertical
         for r, c in horizontal:
             engine.horizontal_walls[r, c] = True
         for r, c in vertical:
@@ -476,6 +489,7 @@ class BrowserAgent:
         self.last_own_screen_xy = None
         self.local_env.engine.walls_left[1] = 10
         self.last_ui_walls_left = 10
+        self.failed_wall_actions.clear()
 
     def _sync_env_from_screen(self, own, opponent, state, centers):
         p1_pos = self._grid_pos(own, centers)
@@ -521,19 +535,40 @@ class BrowserAgent:
         if H_WALL_OFFSET <= action < V_WALL_OFFSET:
             idx = action - H_WALL_OFFSET
             r, c = divmod(idx, 8)
-            gap_x = xs[c + 1] - xs[c]
-            x = xs[c] + gap_x * 0.25
+            x = (xs[c] + xs[c + 1]) / 2.0
             y = (ys[r] + ys[r + 1]) / 2.0
             return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "H", "wall_rc": (r, c)}
 
         if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
             idx = action - V_WALL_OFFSET
             r, c = divmod(idx, 8)
-            gap_y = ys[r + 1] - ys[r]
             x = (xs[c] + xs[c + 1]) / 2.0
-            y = ys[r] + gap_y * 0.25
+            y = (ys[r] + ys[r + 1]) / 2.0
             return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "V", "wall_rc": (r, c)}
         return None
+
+    def _wall_conflicts_with_screen(self, action):
+        parts = _wall_action_parts(action)
+        if parts is None:
+            return True
+        r, c, orientation = parts
+
+        if orientation == "H":
+            if (r, c) in self.screen_horizontal:
+                return True
+            if (r, c - 1) in self.screen_horizontal or (r, c + 1) in self.screen_horizontal:
+                return True
+            if (r, c) in self.screen_vertical:
+                return True
+            return False
+
+        if (r, c) in self.screen_vertical:
+            return True
+        if (r - 1, c) in self.screen_vertical or (r + 1, c) in self.screen_vertical:
+            return True
+        if (r, c) in self.screen_horizontal:
+            return True
+        return False
 
     def _wall_action_options(self, centers):
         if not ALLOW_WALL_ACTIONS or self.local_env.engine.walls_left[1] <= 0:
@@ -541,6 +576,10 @@ class BrowserAgent:
         masks = self.local_env.action_masks()
         options = {}
         for action in range(MOVE_ACTIONS, TOTAL_ACTIONS):
+            if action in self.failed_wall_actions:
+                continue
+            if self._wall_conflicts_with_screen(action):
+                continue
             if not masks[action]:
                 continue
             target = self._wall_click_point(action, centers)
@@ -591,7 +630,27 @@ class BrowserAgent:
 
     def _walls_text(self, wall_counts):
         debug = f" | {self.wall_debug}" if DEBUG_WALLS and self.wall_debug else ""
-        return f"walls H/V={wall_counts} left={self.local_env.engine.walls_left[1]}{debug}"
+        failed = f" failed={len(self.failed_wall_actions)}" if self.failed_wall_actions else ""
+        return f"walls H/V={wall_counts} left={self.local_env.engine.walls_left[1]}{failed}{debug}"
+
+    def _verify_wall_click(self, board, action, old_wall_total):
+        time.sleep(0.75)
+        try:
+            new_state = self._read_screen_state(board)
+            new_centers = self._cell_centers(new_state)
+            if len(new_centers[0]) < 2 or len(new_centers[1]) < 2:
+                return
+            new_counts = self._sync_walls_from_screen(new_state, new_centers)
+            new_wall_total = new_counts[0] + new_counts[1]
+        except Exception:
+            return
+
+        if new_wall_total <= old_wall_total:
+            self.failed_wall_actions.add(action)
+            print(f"[Стена] Сайт не принял {action_name(action)} — убрал это действие из mask до рестарта")
+        else:
+            self.failed_wall_actions.clear()
+            self.local_env.engine.walls_left[1] = max(0, self.local_env.engine.walls_left[1] - 1)
 
     def _play_loop(self, page, board):
         while True:
@@ -654,12 +713,18 @@ class BrowserAgent:
                         f"клик ({target['x']:.1f}, {target['y']:.1f})"
                     )
 
+                old_wall_total = wall_counts[0] + wall_counts[1]
                 page.mouse.move(target["x"], target["y"])
                 page.mouse.click(target["x"], target["y"])
+
                 if action < MOVE_ACTIONS:
                     self.position_history.append(self._target_pos_for_action(p1_pos, action))
                     self.position_history = self.position_history[-12:]
-                time.sleep(1.2)
+                    time.sleep(1.2)
+                else:
+                    self._verify_wall_click(board, action, old_wall_total)
+                    self._sync_walls_left_from_page(page)
+                    time.sleep(0.6)
             except KeyboardInterrupt:
                 print("\n[System] Остановлено пользователем.")
                 break
