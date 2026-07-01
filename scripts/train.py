@@ -30,7 +30,6 @@ OPPONENT_RANDOMNESS = 0.15
 SMART_OBSERVATION = True
 WALL_REWARD = True
 SHOW_PROGRESS_BAR = True
-FORCE_NEW_SMART_MODEL = True
 
 
 def make_quoridor_env():
@@ -127,16 +126,16 @@ def main():
             backup_path.write_bytes(model_path.read_bytes())
             print(f"Сохранил backup старой модели: {backup_path}")
 
-    if FORCE_NEW_SMART_MODEL or not model_path.exists():
-        print("Stage 4: новый smart observation. Начинаем новую модель с нуля...")
-        model = create_new_model(vec_env)
-    else:
-        print("Найдена совместимая модель. Продолжаем обучение...")
+        print("Пробуем загрузить совместимую smart-модель...")
         try:
             model = load_maskable_model(model_path, vec_env)
+            print("Найдена совместимая smart-модель. Продолжаем обучение...")
         except Exception as exc:
-            print(f"Не удалось загрузить старую модель ({type(exc).__name__}). Стартуем с нуля.")
+            print(f"Старая модель несовместима ({type(exc).__name__}). Стартуем Stage 4 с нуля.")
             model = create_new_model(vec_env)
+    else:
+        print("Модель не найдена. Стартуем Stage 4 с нуля.")
+        model = create_new_model(vec_env)
 
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
