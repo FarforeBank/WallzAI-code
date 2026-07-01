@@ -317,20 +317,12 @@ class BrowserAgent:
         if not pawns:
             pawns = sorted(circles, key=lambda circle: circle["r"], reverse=True)[:2]
 
-        teal_pawns = [circle for circle in pawns if _looks_teal(circle)]
-        red_pawns = [circle for circle in pawns if _looks_red(circle)]
-
-        if teal_pawns:
-            own = max(teal_pawns, key=lambda circle: (circle["r"], circle["y"]))
-        else:
-            own = max(pawns, key=lambda circle: circle["y"])
-
-        opponent_pool = [circle for circle in red_pawns if circle is not own]
-        if opponent_pool:
-            opponent = max(opponent_pool, key=lambda circle: circle["r"])
-        else:
-            other_pawns = [circle for circle in pawns if circle is not own]
-            opponent = min(other_pawns, key=lambda circle: circle["y"]) if other_pawns else None
+        # In online games our color can be teal or pink, but the user plays from the
+        # bottom side. Pick the lower large pawn as ours and the upper large pawn as
+        # the opponent. This avoids confusing a teal opponent for our own pawn.
+        own = max(pawns, key=lambda circle: (circle["y"], circle["r"]))
+        opponent_candidates = [circle for circle in pawns if circle is not own]
+        opponent = min(opponent_candidates, key=lambda circle: (circle["y"], -circle["r"])) if opponent_candidates else None
 
         return own, opponent
 
@@ -357,8 +349,6 @@ class BrowserAgent:
             if circle is own:
                 continue
             if circle["r"] >= own_radius * 0.75:
-                continue
-            if not _looks_teal(circle):
                 continue
 
             dot_pos = self._grid_pos(circle, centers)
