@@ -22,67 +22,91 @@ from envs.quoridor.quoridor_env import QuoridorEnv
 
 # One smart architecture for all stages:
 # observation = (9, 9, 5): board, H walls, V walls, our BFS map, opponent BFS map.
-# action space = 140: real movement/jumps/diagonals + all wall placements.
+# action space = 140: real movement/jumps/diagonals + wall placements.
 STAGES = {
     "1": {
         "name": "smart-path-empty",
+        "model_dir": "best_model",
         "random_walls_range": (0, 0),
         "move_only": True,
         "repeat_penalty": True,
         "opponent_policy": "none",
         "opponent_randomness": 0.0,
         "wall_reward": False,
+        "wall_candidate_limit": 0,
         "timesteps": 500_000,
         "n_eval_episodes": 30,
         "description": "learn clean pathing to the finish with no moving opponent and no maze noise",
     },
     "2": {
         "name": "smart-path-maze",
+        "model_dir": "best_model",
         "random_walls_range": (0, 8),
         "move_only": True,
         "repeat_penalty": True,
         "opponent_policy": "none",
         "opponent_randomness": 0.0,
         "wall_reward": False,
+        "wall_candidate_limit": 0,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "learn BFS-map navigation through random wall mazes without opponent pressure",
     },
     "3": {
         "name": "smart-race-opponent",
+        "model_dir": "best_model",
         "random_walls_range": (0, 6),
         "move_only": True,
         "repeat_penalty": True,
         "opponent_policy": "greedy",
         "opponent_randomness": 0.12,
         "wall_reward": False,
+        "wall_candidate_limit": 0,
         "timesteps": 1_500_000,
         "n_eval_episodes": 50,
         "description": "add a moving opponent and refine racing, jumps and diagonals",
     },
     "4": {
-        "name": "smart-wall-soft",
-        "random_walls_range": (0, 4),
+        "name": "smart-wall-soft-fast",
+        "model_dir": "best_model",
+        "random_walls_range": (0, 2),
         "move_only": False,
         "repeat_penalty": True,
         "opponent_policy": "greedy",
-        "opponent_randomness": 0.15,
+        "opponent_randomness": 0.12,
         "wall_reward": True,
-        "timesteps": 2_000_000,
-        "n_eval_episodes": 50,
-        "description": "start learning useful wall placement without too much chaos",
+        "wall_candidate_limit": 24,
+        "timesteps": 1_200_000,
+        "n_eval_episodes": 40,
+        "description": "start learning useful wall placement with a compact candidate mask",
     },
     "5": {
         "name": "smart-wall-hard",
+        "model_dir": "best_model",
         "random_walls_range": (0, 8),
         "move_only": False,
         "repeat_penalty": True,
         "opponent_policy": "greedy",
         "opponent_randomness": 0.25,
         "wall_reward": True,
+        "wall_candidate_limit": 40,
         "timesteps": 3_000_000,
         "n_eval_episodes": 60,
         "description": "full smart model: harder mazes, walls, traps and noisy opponent",
+    },
+    "6": {
+        "name": "empty-board-wall-specialist",
+        "model_dir": "empty_model",
+        "random_walls_range": (0, 0),
+        "move_only": False,
+        "repeat_penalty": True,
+        "opponent_policy": "greedy",
+        "opponent_randomness": 0.10,
+        "wall_reward": True,
+        "wall_candidate_limit": 32,
+        "timesteps": 2_500_000,
+        "n_eval_episodes": 60,
+        "description": "separate specialist model: starts from an empty board and learns its own wall strategy",
     },
 }
 
@@ -97,7 +121,10 @@ def parse_args():
         "--stage",
         choices=sorted(STAGES.keys()),
         default="1",
-        help="Curriculum stage: 1 empty pathing, 2 maze pathing, 3 opponent race, 4 soft walls, 5 hard walls.",
+        help=(
+            "Curriculum stage: 1 empty pathing, 2 maze pathing, 3 opponent race, "
+            "4 soft walls, 5 hard walls, 6 separate empty-board wall specialist."
+        ),
     )
     parser.add_argument(
         "--reset",
@@ -123,6 +150,7 @@ def make_quoridor_env():
         opponent_randomness=cfg["opponent_randomness"],
         smart_observation=SMART_OBSERVATION,
         wall_reward=cfg["wall_reward"],
+        wall_candidate_limit=cfg["wall_candidate_limit"],
     )
 
 
@@ -196,9 +224,11 @@ def main():
     print(CURRENT_STAGE["description"])
     print(
         "Curriculum: "
+        f"model_dir={CURRENT_STAGE['model_dir']}, "
         f"random_walls={CURRENT_STAGE['random_walls_range']}, "
         f"move_only={CURRENT_STAGE['move_only']}, repeat_penalty={CURRENT_STAGE['repeat_penalty']}, "
         f"opponent={CURRENT_STAGE['opponent_policy']}, opponent_randomness={CURRENT_STAGE['opponent_randomness']}, "
+        f"wall_candidate_limit={CURRENT_STAGE['wall_candidate_limit']}, "
         f"smart_observation={SMART_OBSERVATION}, wall_reward={CURRENT_STAGE['wall_reward']}, "
         f"timesteps={timesteps}, progress_bar={SHOW_PROGRESS_BAR}"
     )
@@ -206,7 +236,7 @@ def main():
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)], start_method="spawn")
     eval_env = make_eval_env()
 
-    save_path = ROOT_DIR / "models" / "best_model"
+    save_path = ROOT_DIR / "models" / CURRENT_STAGE["model_dir"]
     log_path = ROOT_DIR / "logs" / "eval" / f"stage_{args.stage}_{CURRENT_STAGE['name']}"
     save_path.mkdir(parents=True, exist_ok=True)
     log_path.mkdir(parents=True, exist_ok=True)
