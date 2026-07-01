@@ -37,6 +37,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.0,
+        "self_trap_penalty": False,
         "timesteps": 500_000,
         "n_eval_episodes": 30,
         "description": "learn clean pathing to the finish with no moving opponent and no maze noise",
@@ -54,6 +55,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.0,
+        "self_trap_penalty": False,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "learn BFS-map navigation through random wall mazes without opponent pressure",
@@ -71,6 +73,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.0,
+        "self_trap_penalty": False,
         "timesteps": 1_500_000,
         "n_eval_episodes": 50,
         "description": "add a moving opponent and refine racing, jumps and diagonals",
@@ -88,6 +91,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.05,
+        "self_trap_penalty": False,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "start learning useful wall placement with a compact candidate mask",
@@ -105,6 +109,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.15,
+        "self_trap_penalty": False,
         "timesteps": 3_000_000,
         "n_eval_episodes": 60,
         "description": "full smart model: harder mazes, both players can wall, traps and noisy opponent",
@@ -122,6 +127,7 @@ STAGES = {
         "opponent_start_advantage_range": (0, 0),
         "defensive_wall_reward": False,
         "opponent_wall_probability": 0.20,
+        "self_trap_penalty": False,
         "timesteps": 2_500_000,
         "n_eval_episodes": 60,
         "description": "separate specialist model: starts from an empty board and learns its own wall strategy",
@@ -139,9 +145,10 @@ STAGES = {
         "opponent_start_advantage_range": (1, 3),
         "defensive_wall_reward": True,
         "opponent_wall_probability": 0.30,
+        "self_trap_penalty": True,
         "timesteps": 1_500_000,
         "n_eval_episodes": 70,
-        "description": "fine-tune current model to defend when the opponent has tempo, walls, and is close to winning",
+        "description": "fine-tune current model to defend, avoid self-traps, and survive opponent wall threats",
     },
 }
 
@@ -154,8 +161,6 @@ MODEL_DEVICE = "cpu"
 def resolve_device(requested: str) -> str:
     requested = requested.lower()
     if requested == "auto":
-        # Env/BFS is the bottleneck, so CPU is often still faster for this small MLP.
-        # But on Apple Silicon we allow MPS when explicitly requested.
         return "cpu"
     if requested == "mps":
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -222,6 +227,7 @@ def make_quoridor_env():
         opponent_start_advantage_range=cfg["opponent_start_advantage_range"],
         defensive_wall_reward=cfg["defensive_wall_reward"],
         opponent_wall_probability=cfg["opponent_wall_probability"],
+        self_trap_penalty=cfg["self_trap_penalty"],
     )
 
 
@@ -312,6 +318,7 @@ def main():
         f"wall_candidate_limit={CURRENT_STAGE['wall_candidate_limit']}, "
         f"smart_observation={SMART_OBSERVATION}, wall_reward={CURRENT_STAGE['wall_reward']}, "
         f"defensive_wall_reward={CURRENT_STAGE['defensive_wall_reward']}, "
+        f"self_trap_penalty={CURRENT_STAGE['self_trap_penalty']}, "
         f"timesteps={timesteps}, progress_bar={SHOW_PROGRESS_BAR}"
     )
 
