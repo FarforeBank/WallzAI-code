@@ -2,14 +2,19 @@
 import time
 from playwright.sync_api import sync_playwright, TimeoutError
 from sb3_contrib import MaskablePPO
-import numpy as np
+from envs.quoridor.quoridor_env import QuoridorEnv
 
-# ВАЖНО: Загрузи свою уже обученную модель
-# model = MaskablePPO.load("models/best_model/best_model.zip")
+# Загружаем модель (или создаем пустышку для теста UI)
+try:
+    model = MaskablePPO.load("models/quoridor_latest.zip") # Берем самую свежую модель
+    print("Загружена обученная модель!")
+except:
+    print("Сохраненная модель не найдена. Загружаем агента со случайными весами для теста UI.")
+    env = QuoridorEnv()
+    model = MaskablePPO("MlpPolicy", env)
 
 def run_browser_agent():
     with sync_playwright() as p:
-        # slow_mo=300 дает сайту время на отрисовку анимаций
         browser = p.chromium.launch(headless=False, slow_mo=300)
         context = browser.new_context()
         page = context.new_page()
@@ -17,13 +22,13 @@ def run_browser_agent():
         print("Открываем Wallz.gg...")
         page.goto("https://wallz.gg/") 
         
-        # Ждем, пока пользователь вручную залогинится или зайдет в лобби
-        print("У тебя есть 20 секунд, чтобы начать игру...")
+        print("У тебя есть 20 секунд, чтобы начать игру или войти в лобби...")
         time.sleep(20)
         
         try:
-            # Ожидание появления SVG-доски
-            page.locator("svg").wait_for(state="visible", timeout=60000)
+            # ИСПРАВЛЕНИЕ: Ищем строго игровую доску по её уникальным координатам
+            board_svg = page.locator("svg[viewBox='-12 -12 660 660']")
+            board_svg.wait_for(state="visible", timeout=60000)
             print("Доска найдена. Агент подключен.")
         except TimeoutError:
             print("Не удалось найти доску. Скрипт остановлен.")
@@ -32,8 +37,7 @@ def run_browser_agent():
         while True:
             try:
                 # 1. ПРОВЕРКА ОЧЕРЕДИ ХОДА
-                # ЗАМЕНИ ".my-turn" НА РЕАЛЬНЫЙ СЕЛЕКТОР САЙТА WALLZ.GG
-                # Например, это может быть подсветка аватара или текст
+                # ЗАМЕНИ ".my-turn-indicator" НА РЕАЛЬНЫЙ СЕЛЕКТОР (когда изучишь DOM во время хода)
                 is_my_turn = page.locator(".my-turn-indicator").is_visible()
                 
                 if not is_my_turn:
@@ -43,36 +47,34 @@ def run_browser_agent():
                 print("Наш ход! Парсим доску...")
 
                 # 2. ПАРСИНГ
-                # ЗАМЕНИ "svg circle.player" НА РЕАЛЬНЫЙ СЕЛЕКТОР ФИШЕК
                 try:
-                    players = page.locator("svg circle.player")
-                    p1_cx = float(players.nth(0).get_attribute("cx"))
-                    p1_cy = float(players.nth(0).get_attribute("cy"))
+                    # Ищем кружки (фишки) ТОЛЬКО внутри найденной доски
+                    players = board_svg.locator("circle")
+                    
+                    # Пытаемся получить координаты первой фишки (просто для теста парсинга)
+                    if players.count() > 0:
+                        p1_cx = float(players.nth(0).get_attribute("cx") or 0)
+                        p1_cy = float(players.nth(0).get_attribute("cy") or 0)
+                        print(f"Координаты фишки: cx={p1_cx}, cy={p1_cy}")
+                    else:
+                        print("Фишки не найдены.")
+                        
                 except Exception as e:
                     print(f"Ошибка парсинга элементов (SVG обновился): {e}")
                     time.sleep(1)
-                    continue # Пробуем заново в следующем цикле
+                    continue 
 
-                # --- ТУТ НУЖНО СКОНВЕРТИРОВАТЬ CX/CY В ИНДЕКСЫ 0-8 ---
-                # matrix_x = int(p1_cx / cell_width) ...
-                
-                # 3. ИНФЕРЕНС АГЕНТА (Заглушка)
-                # obs = get_obs_from_parsed_data()
-                # action, _states = model.predict(obs, action_masks=get_masks())
-                
-                # 4. ДЕЙСТВИЕ (КЛИК)
-                target_x_svg = 150 # Вычисленная координата клика
+                # 3. ДЕЙСТВИЕ (КЛИК) - Тестовый клик по координатам внутри SVG
+                target_x_svg = 150 
                 target_y_svg = 200
                 
-                # Кликаем напрямую по координатам SVG-полотна, чтобы избежать TargetClosedError
-                svg_box = page.locator("svg").bounding_box()
+                svg_box = board_svg.bounding_box()
                 if svg_box:
                     click_x = svg_box["x"] + target_x_svg
                     click_y = svg_box["y"] + target_y_svg
                     page.mouse.click(click_x, click_y)
-                    print("Ход сделан.")
+                    print(f"Выполнен клик по экрану: x={click_x}, y={click_y}")
                 
-                # Ждем, пока ход засчитается сайтом
                 time.sleep(2)
 
             except Exception as e:
