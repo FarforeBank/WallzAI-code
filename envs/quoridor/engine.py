@@ -171,18 +171,13 @@ class QuoridorEngine:
             return False
 
         # Temporarily place the wall to ensure both players still have a path.
-        if orientation == "H":
-            self.horizontal_walls[r, c] = True
-        else:
-            self.vertical_walls[r, c] = True
-
-        p1_dist = self.get_bfs_distance(self.p1_pos, 0)
-        p2_dist = self.get_bfs_distance(self.p2_pos, 8)
-
-        if orientation == "H":
-            self.horizontal_walls[r, c] = False
-        else:
-            self.vertical_walls[r, c] = False
+        wall_array = self.horizontal_walls if orientation == "H" else self.vertical_walls
+        wall_array[r, c] = True
+        try:
+            p1_dist = self.get_bfs_distance(self.p1_pos, 0)
+            p2_dist = self.get_bfs_distance(self.p2_pos, 8)
+        finally:
+            wall_array[r, c] = False
 
         return p1_dist != 999 and p2_dist != 999
 
