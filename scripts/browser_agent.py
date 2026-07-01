@@ -263,13 +263,10 @@ class BrowserAgent:
         short_side = min(w, h)
         ratio = long_side / max(1.0, short_side)
 
-        # Exclude normal cell squares / board background.
         squareish = 0.65 <= (w / h if h else 0) <= 1.55
         if squareish and w >= gap * 0.45 and h >= gap * 0.45:
             return None
 
-        # Placed walls are long thin bars. Wallz may render them as rect/path/line,
-        # so geometry is more reliable than tag name.
         if ratio < 1.8:
             return None
         if short_side > gap * 0.65:
@@ -370,13 +367,16 @@ class BrowserAgent:
             if action is not None:
                 options[action] = circle
 
-        # Fallback: sometimes Wallz does not expose the final/top legal dot as a teal circle.
-        # Add locally-valid move targets as synthetic cell-center clicks.
-        valid_moves = self.local_env.engine.get_valid_moves(1)
-        for action, (dx, dy) in MOVE_DELTAS.items():
-            target_pos = (own_pos[0] + dx, own_pos[1] + dy)
-            if target_pos in valid_moves and action not in options:
-                options[action] = self._cell_point(target_pos, centers)
+        # Important: if we play second, before our turn Wallz may show no real move dots.
+        # Do not create synthetic moves from the local env in that case, otherwise the bot
+        # clicks while it is still the opponent's turn. Synthetic fallback is only used to
+        # fill a missing nearby dot after at least one real own-move dot is visible.
+        if options:
+            valid_moves = self.local_env.engine.get_valid_moves(1)
+            for action, (dx, dy) in MOVE_DELTAS.items():
+                target_pos = (own_pos[0] + dx, own_pos[1] + dy)
+                if target_pos in valid_moves and action not in options:
+                    options[action] = self._cell_point(target_pos, centers)
 
         return options
 
@@ -389,16 +389,26 @@ class BrowserAgent:
             return predicted_action, False
 
         predicted_pos = self._target_pos_for_action(p1_pos, predicted_action)
+        current_dist = self.local_env.engine.get_bfs_distance(p1_pos, 0)
+        predicted_dist = self.local_env.engine.get_bfs_distance(predicted_pos, 0)
+
+        # Never override a move that really gets us closer to the finish.
+        if predicted_dist < current_dist:
+            return predicted_action, False
+
         recent = set(self.position_history[-4:])
-        if predicted_pos not in recent:
+        immediate_backtrack = len(self.position_history) >= 2 and predicted_pos == self.position_history[-2]
+        short_loop = predicted_pos in recent
+        if not immediate_backtrack and not short_loop:
             return predicted_action, False
 
         def score(action):
             target_pos = self._target_pos_for_action(p1_pos, action)
             dist = self.local_env.engine.get_bfs_distance(target_pos, 0)
-            repeat = 3.0 if target_pos in recent else 0.0
-            side = abs(target_pos[0] - 4) * 0.05
-            return dist + repeat + side
+            repeat = 2.5 if target_pos in recent else 0.0
+            backward = 2.0 if target_pos[1] > p1_pos[1] else 0.0
+            side = abs(target_pos[0] - 4) * 0.04
+            return dist + repeat + backward + side
 
         best_action = min(move_options.keys(), key=score)
         return best_action, best_action != predicted_action
@@ -428,7 +438,7 @@ class BrowserAgent:
 
                 move_options = self._screen_move_options(own, state, centers)
                 if not move_options:
-                    print(f"[Ожидание] Нет доступных точек хода | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
+                    print(f"[Ожидание] Жду свой ход | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
                     time.sleep(0.7)
                     continue
 
