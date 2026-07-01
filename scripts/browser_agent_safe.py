@@ -34,9 +34,10 @@ def safe_svg_wall_from_item(self, item):
         return None
 
     orientation, r, c = parsed
-    if orientation == "H":
-        r = 7 - r
-    return orientation, r, c
+    # The board SVG content is inside rotate(180 318 318). Raw SVG wall rows and
+    # columns are therefore mirrored relative to the visual grid that the env and
+    # pawn parser use. Convert raw DOM wall coordinates back to visual/env coords.
+    return orientation, 7 - r, 7 - c
 
 
 def safe_wall_click_point(self, action, centers):
@@ -264,7 +265,7 @@ def main():
     browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: tray drag H/V + exact slot verification + wall-failure fallback")
+    print("[System] Safe wall mode: tray drag H/V + rotated SVG parse fix + exact slot verification")
     if args.no_walls:
         print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
