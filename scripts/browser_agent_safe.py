@@ -34,19 +34,10 @@ def safe_svg_wall_from_item(self, item):
         return None
 
     orientation, r, c = parsed
-    # The board SVG content is inside rotate(180 318 318). Raw SVG wall rows and
-    # columns are therefore mirrored relative to the visual grid that the env and
-    # pawn parser use. Convert raw DOM wall coordinates back to visual/env coords.
     return orientation, 7 - r, 7 - c
 
 
 def safe_wall_click_point(self, action, centers):
-    """Return the visual drop point for a wall action.
-
-    Wallz exposes a wall tray with draggable H/V wall pieces. For drag-and-drop
-    the orientation comes from the tray source, so the target should be the slot
-    center rather than a biased click point.
-    """
     xs, ys = centers
     if len(xs) < 9 or len(ys) < 9:
         return None
@@ -132,7 +123,7 @@ def _tray_locator(page, orientation):
     return page.locator("button[aria-label*='vertical wall']").first
 
 
-def drag_wall_from_tray(page, orientation, target):
+def _manual_drag_wall_from_tray(page, orientation, target):
     locator = _tray_locator(page, orientation)
     box = locator.bounding_box(timeout=1500)
     if box is None:
@@ -144,10 +135,47 @@ def drag_wall_from_tray(page, orientation, target):
     end_y = target["y"]
 
     page.mouse.move(start_x, start_y)
-    page.mouse.down()
+    time.sleep(0.05)
+    page.mouse.down(button="left")
+    time.sleep(0.12)
+    page.mouse.move((start_x + end_x) / 2.0, (start_y + end_y) / 2.0, steps=12)
     page.mouse.move(end_x, end_y, steps=18)
-    time.sleep(0.08)
-    page.mouse.up()
+    time.sleep(0.25)
+    page.mouse.up(button="left")
+    time.sleep(0.15)
+
+
+def drag_wall_from_tray(page, board, orientation, target):
+    locator = _tray_locator(page, orientation)
+    board_box = board.bounding_box(timeout=1500)
+    if board_box is None:
+        raise RuntimeError("Board bounding box not found")
+
+    source_box = locator.bounding_box(timeout=1500)
+    if source_box is None:
+        raise RuntimeError(f"Wall tray button not found for orientation={orientation}")
+
+    target_position = {
+        "x": target["x"] - board_box["x"],
+        "y": target["y"] - board_box["y"],
+    }
+    source_position = {
+        "x": source_box["width"] / 2.0,
+        "y": source_box["height"] / 2.0,
+    }
+
+    try:
+        locator.drag_to(
+            board,
+            source_position=source_position,
+            target_position=target_position,
+            timeout=2500,
+            force=True,
+        )
+        time.sleep(0.2)
+    except Exception as exc:
+        print(f"[Стена] drag_to не сработал ({type(exc).__name__}), пробую ручной drag")
+        _manual_drag_wall_from_tray(page, orientation, target)
 
 
 def safe_play_loop(self, page, board):
@@ -220,10 +248,10 @@ def safe_play_loop(self, page, board):
                 r, c, orientation = parts
                 print(
                     f"[Стена] P1={p1_pos} P2={p2_pos} | {walls_text} | "
-                    f"действие {action} {browser_agent_module.action_name(action)} | drag-{orientation} | "
+                    f"действие {action} {browser_agent_module.action_name(action)} | drag_to-{orientation} | "
                     f"drop ({target['x']:.1f}, {target['y']:.1f})"
                 )
-                drag_wall_from_tray(page, orientation, target)
+                drag_wall_from_tray(page, board, orientation, target)
                 self._verify_wall_click(board, action, old_wall_total)
                 self._sync_walls_left_from_page(page)
                 time.sleep(0.6)
@@ -265,7 +293,7 @@ def main():
     browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: tray drag H/V + rotated SVG parse fix + exact slot verification")
+    print("[System] Safe wall mode: Playwright drag_to + manual fallback + rotated SVG parse fix")
     if args.no_walls:
         print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
