@@ -13,6 +13,7 @@ MODEL_ALIASES = {
     "empty": ROOT_DIR / "models" / "empty_model" / "best_model.zip",
 }
 
+_original_svg_wall_from_item = browser_agent_module.BrowserAgent._svg_wall_from_item
 _original_sync_walls_from_screen = browser_agent_module.BrowserAgent._sync_walls_from_screen
 
 
@@ -24,6 +25,17 @@ def resolve_model_path(value: str) -> Path:
     if not path.is_absolute():
         path = ROOT_DIR / path
     return path
+
+
+def safe_svg_wall_from_item(self, item):
+    parsed = _original_svg_wall_from_item(self, item)
+    if parsed is None:
+        return None
+
+    orientation, r, c = parsed
+    if orientation == "H":
+        r = 7 - r
+    return orientation, r, c
 
 
 def safe_wall_click_point(self, action, centers):
@@ -40,7 +52,7 @@ def safe_wall_click_point(self, action, centers):
         return None
 
     gap = min(browser_agent_module._median_gap(xs), browser_agent_module._median_gap(ys))
-    bias = max(10.0, min(18.0, gap * 0.22))
+    bias = max(6.0, min(10.0, gap * 0.12))
 
     if browser_agent_module.H_WALL_OFFSET <= action < browser_agent_module.V_WALL_OFFSET:
         idx = action - browser_agent_module.H_WALL_OFFSET
@@ -152,6 +164,7 @@ def safe_verify_wall_click(self, board, action, old_wall_total):
 
 
 def install_safe_wall_patches():
+    browser_agent_module.BrowserAgent._svg_wall_from_item = safe_svg_wall_from_item
     browser_agent_module.BrowserAgent._wall_click_point = safe_wall_click_point
     browser_agent_module.BrowserAgent._verify_wall_click = safe_verify_wall_click
     browser_agent_module.BrowserAgent._sync_walls_from_screen = safe_sync_walls_from_screen
@@ -178,7 +191,7 @@ def main():
     browser_agent_module.MODEL_PATH = model_path
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: offset H/V clicks + exact expected-slot verification")
+    print("[System] Safe wall mode: H-row parser fix + offset H/V clicks + exact expected-slot verification")
     browser_agent_module.BrowserAgent().run()
 
 
