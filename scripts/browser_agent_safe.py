@@ -49,8 +49,7 @@ def safe_wall_click_point(self, action, centers):
     if browser_agent_module.H_WALL_OFFSET <= action < browser_agent_module.V_WALL_OFFSET:
         idx = action - browser_agent_module.H_WALL_OFFSET
         r, c = divmod(idx, 8)
-        drop_r, drop_c = 7 - r, 7 - c
-        x, y = _wall_slot_center(xs, ys, drop_r, drop_c)
+        x, y = _wall_slot_center(xs, ys, r, c)
         return {
             "x": x,
             "y": y,
@@ -59,14 +58,13 @@ def safe_wall_click_point(self, action, centers):
             "kind": "wall-drag",
             "orientation": "H",
             "wall_rc": (r, c),
-            "drop_rc": (drop_r, drop_c),
+            "drop_rc": (r, c),
         }
 
     if browser_agent_module.V_WALL_OFFSET <= action < browser_agent_module.TOTAL_ACTIONS:
         idx = action - browser_agent_module.V_WALL_OFFSET
         r, c = divmod(idx, 8)
-        drop_r, drop_c = 7 - r, 7 - c
-        x, y = _wall_slot_center(xs, ys, drop_r, drop_c)
+        x, y = _wall_slot_center(xs, ys, r, c)
         return {
             "x": x,
             "y": y,
@@ -75,7 +73,7 @@ def safe_wall_click_point(self, action, centers):
             "kind": "wall-drag",
             "orientation": "V",
             "wall_rc": (r, c),
-            "drop_rc": (drop_r, drop_c),
+            "drop_rc": (r, c),
         }
 
     return None
@@ -317,7 +315,7 @@ def main():
     browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: mirrored wall drag targets + rotated SVG parse fix")
+    print("[System] Safe wall mode: direct wall drag targets + rotated SVG parse fix")
     if args.no_walls:
         print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
