@@ -37,6 +37,10 @@ def safe_svg_wall_from_item(self, item):
     return orientation, 7 - r, 7 - c
 
 
+def _wall_slot_center(xs, ys, r, c):
+    return (xs[c] + xs[c + 1]) / 2.0, (ys[r] + ys[r + 1]) / 2.0
+
+
 def safe_wall_click_point(self, action, centers):
     xs, ys = centers
     if len(xs) < 9 or len(ys) < 9:
@@ -45,16 +49,34 @@ def safe_wall_click_point(self, action, centers):
     if browser_agent_module.H_WALL_OFFSET <= action < browser_agent_module.V_WALL_OFFSET:
         idx = action - browser_agent_module.H_WALL_OFFSET
         r, c = divmod(idx, 8)
-        x = (xs[c] + xs[c + 1]) / 2.0
-        y = (ys[r] + ys[r + 1]) / 2.0
-        return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall-drag", "orientation": "H", "wall_rc": (r, c)}
+        drop_r, drop_c = 7 - r, 7 - c
+        x, y = _wall_slot_center(xs, ys, drop_r, drop_c)
+        return {
+            "x": x,
+            "y": y,
+            "r": 0.0,
+            "synthetic": False,
+            "kind": "wall-drag",
+            "orientation": "H",
+            "wall_rc": (r, c),
+            "drop_rc": (drop_r, drop_c),
+        }
 
     if browser_agent_module.V_WALL_OFFSET <= action < browser_agent_module.TOTAL_ACTIONS:
         idx = action - browser_agent_module.V_WALL_OFFSET
         r, c = divmod(idx, 8)
-        x = (xs[c] + xs[c + 1]) / 2.0
-        y = (ys[r] + ys[r + 1]) / 2.0
-        return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall-drag", "orientation": "V", "wall_rc": (r, c)}
+        drop_r, drop_c = 7 - r, 7 - c
+        x, y = _wall_slot_center(xs, ys, drop_r, drop_c)
+        return {
+            "x": x,
+            "y": y,
+            "r": 0.0,
+            "synthetic": False,
+            "kind": "wall-drag",
+            "orientation": "V",
+            "wall_rc": (r, c),
+            "drop_rc": (drop_r, drop_c),
+        }
 
     return None
 
@@ -246,9 +268,11 @@ def safe_play_loop(self, page, board):
                     time.sleep(0.5)
                     continue
                 r, c, orientation = parts
+                drop_rc = target.get("drop_rc")
+                drop_note = f" raw_drop={drop_rc}" if drop_rc else ""
                 print(
                     f"[Стена] P1={p1_pos} P2={p2_pos} | {walls_text} | "
-                    f"действие {action} {browser_agent_module.action_name(action)} | drag_to-{orientation} | "
+                    f"действие {action} {browser_agent_module.action_name(action)} | drag_to-{orientation}{drop_note} | "
                     f"drop ({target['x']:.1f}, {target['y']:.1f})"
                 )
                 drag_wall_from_tray(page, board, orientation, target)
@@ -293,7 +317,7 @@ def main():
     browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: Playwright drag_to + manual fallback + rotated SVG parse fix")
+    print("[System] Safe wall mode: mirrored wall drag targets + rotated SVG parse fix")
     if args.no_walls:
         print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
