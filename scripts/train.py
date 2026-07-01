@@ -2,10 +2,16 @@ import os
 import sys
 from pathlib import Path
 
-from stable_baselines3.common.vec_env import SubprocVecEnv
+import torch
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+
+# Torch 2.x can be overly strict when validating categorical probability simplexes
+# after action masking. MaskablePPO already receives finite logits; this avoids
+# rare false-positive crashes during long runs.
+torch.distributions.Distribution.set_default_validate_args(False)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -57,6 +63,11 @@ def load_maskable_model(model_path: Path, env):
             "action_space": env.action_space,
         },
     )
+
+
+def save_model_safely(model, model_path: Path, reason: str):
+    print(f"\n{reason} Сохраняем прогресс в {model_path}...")
+    model.save(str(model_path))
 
 
 def main():
@@ -116,8 +127,10 @@ def main():
             progress_bar=SHOW_PROGRESS_BAR,
         )
     except KeyboardInterrupt:
-        print("\nОбучение прервано пользователем. Сохраняем прогресс...")
-        model.save(str(model_path))
+        save_model_safely(model, model_path, "Обучение прервано пользователем.")
+    except Exception as exc:
+        save_model_safely(model, model_path, f"Обучение упало с ошибкой {type(exc).__name__}:")
+        raise
     finally:
         try:
             vec_env.close()
