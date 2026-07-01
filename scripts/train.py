@@ -29,7 +29,7 @@ def main():
     os.makedirs("./models", exist_ok=True)
     os.makedirs("./logs", exist_ok=True)
 
-    num_envs = 10
+    num_envs = 24
     print(f"Инициализация {num_envs} параллельных сред...")
     
     # Создаем многопроцессорную среду для ускорения обучения
@@ -59,7 +59,7 @@ def main():
         eval_env, 
         best_model_save_path='./models/best_model',
         log_path='./logs/eval', 
-        eval_freq=1000,  # Тесты и вывод наград будут печататься чаще (каждые 10 000 глобальных шагов)
+        eval_freq=500,  # Тесты и вывод наград будут печататься чаще (каждые 10 000 глобальных шагов)
         deterministic=False, 
         render=False
     )
@@ -67,7 +67,7 @@ def main():
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
         # Добавлен параметр progress_bar=True для отображения ETA
-        model.learn(total_timesteps=10_000_000, callback=eval_callback, progress_bar=True)
+        model.learn(total_timesteps=3_000_000, callback=eval_callback, progress_bar=True)
     except KeyboardInterrupt:
         print("\nОбучение прервано пользователем. Сохраняем прогресс...")
     finally:
