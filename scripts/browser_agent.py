@@ -29,6 +29,7 @@ ACTION_NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
 RGB_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
 CYCLE_GUARD = True
 DEBUG_WALLS = True
+USE_SYNTHETIC_MOVES = False
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
@@ -464,11 +465,7 @@ class BrowserAgent:
             if action is not None:
                 options[action] = circle
 
-        # Important: if we play second, before our turn Wallz may show no real move dots.
-        # Do not create synthetic moves from the local env in that case, otherwise the bot
-        # clicks while it is still the opponent's turn. Synthetic fallback is only used to
-        # fill a missing nearby dot after at least one real own-move dot is visible.
-        if options:
+        if USE_SYNTHETIC_MOVES and options:
             valid_moves = self.local_env.engine.get_valid_moves(1)
             for action, (dx, dy) in MOVE_DELTAS.items():
                 target_pos = (own_pos[0] + dx, own_pos[1] + dy)
