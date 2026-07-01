@@ -34,6 +34,8 @@ STAGES = {
         "opponent_randomness": 0.0,
         "wall_reward": False,
         "wall_candidate_limit": 0,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 500_000,
         "n_eval_episodes": 30,
         "description": "learn clean pathing to the finish with no moving opponent and no maze noise",
@@ -48,6 +50,8 @@ STAGES = {
         "opponent_randomness": 0.0,
         "wall_reward": False,
         "wall_candidate_limit": 0,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "learn BFS-map navigation through random wall mazes without opponent pressure",
@@ -62,6 +66,8 @@ STAGES = {
         "opponent_randomness": 0.12,
         "wall_reward": False,
         "wall_candidate_limit": 0,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 1_500_000,
         "n_eval_episodes": 50,
         "description": "add a moving opponent and refine racing, jumps and diagonals",
@@ -76,6 +82,8 @@ STAGES = {
         "opponent_randomness": 0.12,
         "wall_reward": True,
         "wall_candidate_limit": 24,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 1_200_000,
         "n_eval_episodes": 40,
         "description": "start learning useful wall placement with a compact candidate mask",
@@ -90,6 +98,8 @@ STAGES = {
         "opponent_randomness": 0.25,
         "wall_reward": True,
         "wall_candidate_limit": 40,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 3_000_000,
         "n_eval_episodes": 60,
         "description": "full smart model: harder mazes, walls, traps and noisy opponent",
@@ -104,9 +114,27 @@ STAGES = {
         "opponent_randomness": 0.10,
         "wall_reward": True,
         "wall_candidate_limit": 32,
+        "opponent_start_advantage_range": (0, 0),
+        "defensive_wall_reward": False,
         "timesteps": 2_500_000,
         "n_eval_episodes": 60,
         "description": "separate specialist model: starts from an empty board and learns its own wall strategy",
+    },
+    "7": {
+        "name": "defensive-wall-finetune",
+        "model_dir": "best_model",
+        "random_walls_range": (0, 2),
+        "move_only": False,
+        "repeat_penalty": True,
+        "opponent_policy": "greedy",
+        "opponent_randomness": 0.10,
+        "wall_reward": True,
+        "wall_candidate_limit": 64,
+        "opponent_start_advantage_range": (1, 3),
+        "defensive_wall_reward": True,
+        "timesteps": 1_500_000,
+        "n_eval_episodes": 70,
+        "description": "fine-tune current model to defend when the opponent has tempo and is close to winning",
     },
 }
 
@@ -123,7 +151,7 @@ def parse_args():
         default="1",
         help=(
             "Curriculum stage: 1 empty pathing, 2 maze pathing, 3 opponent race, "
-            "4 soft walls, 5 hard walls, 6 separate empty-board wall specialist."
+            "4 soft walls, 5 hard walls, 6 empty-board specialist, 7 defensive fine-tune."
         ),
     )
     parser.add_argument(
@@ -151,6 +179,8 @@ def make_quoridor_env():
         smart_observation=SMART_OBSERVATION,
         wall_reward=cfg["wall_reward"],
         wall_candidate_limit=cfg["wall_candidate_limit"],
+        opponent_start_advantage_range=cfg["opponent_start_advantage_range"],
+        defensive_wall_reward=cfg["defensive_wall_reward"],
     )
 
 
@@ -228,8 +258,10 @@ def main():
         f"random_walls={CURRENT_STAGE['random_walls_range']}, "
         f"move_only={CURRENT_STAGE['move_only']}, repeat_penalty={CURRENT_STAGE['repeat_penalty']}, "
         f"opponent={CURRENT_STAGE['opponent_policy']}, opponent_randomness={CURRENT_STAGE['opponent_randomness']}, "
+        f"opponent_start_advantage={CURRENT_STAGE['opponent_start_advantage_range']}, "
         f"wall_candidate_limit={CURRENT_STAGE['wall_candidate_limit']}, "
         f"smart_observation={SMART_OBSERVATION}, wall_reward={CURRENT_STAGE['wall_reward']}, "
+        f"defensive_wall_reward={CURRENT_STAGE['defensive_wall_reward']}, "
         f"timesteps={timesteps}, progress_bar={SHOW_PROGRESS_BAR}"
     )
 
