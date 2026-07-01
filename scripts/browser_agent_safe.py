@@ -15,6 +15,7 @@ MODEL_ALIASES = {
 
 _original_svg_wall_from_item = browser_agent_module.BrowserAgent._svg_wall_from_item
 _original_sync_walls_from_screen = browser_agent_module.BrowserAgent._sync_walls_from_screen
+WALL_FAILURE_LIMIT = 3
 
 
 def resolve_model_path(value: str) -> Path:
@@ -39,14 +40,6 @@ def safe_svg_wall_from_item(self, item):
 
 
 def safe_wall_click_point(self, action, centers):
-    """Click away from the ambiguous H/V intersection.
-
-    The original browser_agent clicks the exact center shared by horizontal and
-    vertical wall slots. Wallz may then choose the wrong orientation. This keeps
-    the same slot math but biases the click along the requested wall direction:
-    horizontal walls are clicked slightly left/right of the crossing, vertical
-    walls slightly up/down of it.
-    """
     xs, ys = centers
     if len(xs) < 9 or len(ys) < 9:
         return None
@@ -59,40 +52,16 @@ def safe_wall_click_point(self, action, centers):
         r, c = divmod(idx, 8)
         x = (xs[c] + xs[c + 1]) / 2.0
         y = (ys[r] + ys[r + 1]) / 2.0
-        if c < 7:
-            x += bias
-        else:
-            x -= bias
-        return {
-            "x": x,
-            "y": y,
-            "r": 0.0,
-            "synthetic": False,
-            "kind": "wall",
-            "orientation": "H",
-            "wall_rc": (r, c),
-            "safe_bias": bias,
-        }
+        x += bias if c < 7 else -bias
+        return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "H", "wall_rc": (r, c)}
 
     if browser_agent_module.V_WALL_OFFSET <= action < browser_agent_module.TOTAL_ACTIONS:
         idx = action - browser_agent_module.V_WALL_OFFSET
         r, c = divmod(idx, 8)
         x = (xs[c] + xs[c + 1]) / 2.0
         y = (ys[r] + ys[r + 1]) / 2.0
-        if r < 7:
-            y += bias
-        else:
-            y -= bias
-        return {
-            "x": x,
-            "y": y,
-            "r": 0.0,
-            "synthetic": False,
-            "kind": "wall",
-            "orientation": "V",
-            "wall_rc": (r, c),
-            "safe_bias": bias,
-        }
+        y += bias if r < 7 else -bias
+        return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "V", "wall_rc": (r, c)}
 
     return None
 
@@ -110,10 +79,7 @@ def safe_sync_walls_from_screen(self, state, centers):
         self.screen_vertical = prev_vertical
         self.local_env.engine.horizontal_walls[:, :] = prev_h_array
         self.local_env.engine.vertical_walls[:, :] = prev_v_array
-        self.wall_debug = (
-            f"ignored impossible parse H/V={counts}; "
-            f"kept H={sorted(prev_horizontal)} V={sorted(prev_vertical)}"
-        )
+        self.wall_debug = f"ignored impossible parse H/V={counts}; kept H={sorted(prev_horizontal)} V={sorted(prev_vertical)}"
         print(f"[Стены] Подозрительный SVG parse: H/V={counts} > 20, оставил прошлое состояние")
         return len(prev_horizontal), len(prev_vertical)
 
@@ -121,7 +87,6 @@ def safe_sync_walls_from_screen(self, state, centers):
 
 
 def safe_verify_wall_click(self, board, action, old_wall_total):
-    """Accept a wall click only if the exact expected slot appears on screen."""
     time.sleep(0.9)
     try:
         new_state = self._read_screen_state(board)
@@ -138,10 +103,7 @@ def safe_verify_wall_click(self, board, action, old_wall_total):
         return
 
     r, c, orientation = parts
-    if orientation == "H":
-        expected_present = (r, c) in self.screen_horizontal
-    else:
-        expected_present = (r, c) in self.screen_vertical
+    expected_present = (r, c) in (self.screen_horizontal if orientation == "H" else self.screen_vertical)
 
     if expected_present:
         self.failed_wall_actions.clear()
@@ -152,15 +114,14 @@ def safe_verify_wall_click(self, board, action, old_wall_total):
     expected = f"{orientation}({r}, {c})"
     actual = f"H={sorted(self.screen_horizontal)} V={sorted(self.screen_vertical)}"
     if new_wall_total > old_wall_total:
-        print(
-            f"[Стена] Сайт поставил не ожидаемый слот для {browser_agent_module.action_name(action)}; "
-            f"ждали {expected}, увидели {actual}. Убрал действие из mask."
-        )
+        print(f"[Стена] Сайт поставил не ожидаемый слот для {browser_agent_module.action_name(action)}; ждали {expected}, увидели {actual}. Убрал действие из mask.")
     else:
-        print(
-            f"[Стена] Сайт не принял {browser_agent_module.action_name(action)} — "
-            f"ждали {expected}, увидели {actual}. Убрал действие из mask."
-        )
+        print(f"[Стена] Сайт не принял {browser_agent_module.action_name(action)} — ждали {expected}, увидели {actual}. Убрал действие из mask.")
+
+    if len(self.failed_wall_actions) >= WALL_FAILURE_LIMIT:
+        browser_agent_module.ALLOW_WALL_ACTIONS = False
+        self.failed_wall_actions.clear()
+        print(f"[Стена] {WALL_FAILURE_LIMIT} ошибки стен подряд. Wall-actions отключены до перезапуска агента.")
 
 
 def install_safe_wall_patches():
@@ -171,16 +132,16 @@ def install_safe_wall_patches():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run Wallz browser agent with safer wall clicks and exact wall verification."
-    )
+    parser = argparse.ArgumentParser(description="Run Wallz browser agent with safer wall clicks and exact wall verification.")
     parser.add_argument(
         "--model",
         default="best",
-        help=(
-            "Model alias or path. Aliases: best=models/best_model/best_model.zip, "
-            "empty=models/empty_model/best_model.zip. Relative paths are resolved from repo root."
-        ),
+        help="Model alias or path. Aliases: best=models/best_model/best_model.zip, empty=models/empty_model/best_model.zip. Relative paths are resolved from repo root.",
+    )
+    parser.add_argument(
+        "--no-walls",
+        action="store_true",
+        help="Disable wall actions from the start. Useful while Wallz wall-click mapping is unstable.",
     )
     return parser.parse_args()
 
@@ -189,9 +150,12 @@ def main():
     args = parse_args()
     model_path = resolve_model_path(args.model)
     browser_agent_module.MODEL_PATH = model_path
+    browser_agent_module.ALLOW_WALL_ACTIONS = not args.no_walls
     install_safe_wall_patches()
     print(f"[System] Выбрана модель: {model_path}")
-    print("[System] Safe wall mode: H-row parser fix + offset H/V clicks + exact expected-slot verification")
+    print("[System] Safe wall mode: H-row parser fix + exact slot verification + wall-failure fallback")
+    if args.no_walls:
+        print("[System] Wall-actions отключены с запуска (--no-walls)")
     browser_agent_module.BrowserAgent().run()
 
 
