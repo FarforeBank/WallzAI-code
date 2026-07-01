@@ -2,6 +2,9 @@ import numpy as np
 from collections import deque
 
 
+ORTHOGONAL_DIRS = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+
+
 class QuoridorEngine:
     def __init__(self):
         self.board_size = 9
@@ -20,7 +23,15 @@ class QuoridorEngine:
     def reset(self):
         self.__init__()
 
+    def _in_bounds(self, x, y):
+        return 0 <= x < self.board_size and 0 <= y < self.board_size
+
     def has_wall_between(self, x1, y1, x2, y2):
+        if not self._in_bounds(x1, y1) or not self._in_bounds(x2, y2):
+            return True
+        if abs(x1 - x2) + abs(y1 - y2) != 1:
+            return True
+
         if x1 == x2:  # Vertical movement: check horizontal walls.
             y_min = min(y1, y2)
             if x1 < 8 and self.horizontal_walls[y_min, x1]:
@@ -35,32 +46,83 @@ class QuoridorEngine:
                 return True
         return False
 
-    def get_valid_moves(self, player_id):
-        pos = self.p1_pos if player_id == 1 else self.p2_pos
-        x, y = pos
-        moves = []
-        directions = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+    def _pawn_pos(self, player_id):
+        return self.p1_pos if player_id == 1 else self.p2_pos
 
-        for dx, dy in directions:
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.board_size and 0 <= ny < self.board_size:
-                if not self.has_wall_between(x, y, nx, ny) and self.board[ny, nx] == 0:
-                    moves.append((nx, ny))
-        return moves
+    def _opponent_pos(self, player_id):
+        return self.p2_pos if player_id == 1 else self.p1_pos
+
+    def get_valid_moves(self, player_id):
+        """Return legal pawn target cells, including jumps and diagonals.
+
+        Quoridor movement rules:
+        - Move one orthogonal cell if there is no wall.
+        - If the adjacent cell contains the opponent, jump straight over them when possible.
+        - If the straight jump is blocked by wall/edge, move diagonally around the opponent.
+        """
+        x, y = self._pawn_pos(player_id)
+        opponent = self._opponent_pos(player_id)
+        moves = []
+
+        for dx, dy in ORTHOGONAL_DIRS:
+            ax, ay = x + dx, y + dy
+            if not self._in_bounds(ax, ay):
+                continue
+            if self.has_wall_between(x, y, ax, ay):
+                continue
+
+            if (ax, ay) != opponent:
+                if self.board[ay, ax] == 0:
+                    moves.append((ax, ay))
+                continue
+
+            # Opponent is adjacent: try straight jump first.
+            jx, jy = ax + dx, ay + dy
+            can_jump = (
+                self._in_bounds(jx, jy)
+                and not self.has_wall_between(ax, ay, jx, jy)
+                and self.board[jy, jx] == 0
+            )
+            if can_jump:
+                moves.append((jx, jy))
+                continue
+
+            # Straight jump is blocked by wall/edge: diagonal around opponent.
+            if dx == 0:
+                perpendicular = [(-1, 0), (1, 0)]
+            else:
+                perpendicular = [(0, -1), (0, 1)]
+
+            for pdx, pdy in perpendicular:
+                tx, ty = ax + pdx, ay + pdy
+                if not self._in_bounds(tx, ty):
+                    continue
+                if self.has_wall_between(ax, ay, tx, ty):
+                    continue
+                if self.board[ty, tx] == 0:
+                    moves.append((tx, ty))
+
+        # Preserve order but remove duplicates, because diagonal paths can converge.
+        seen = set()
+        unique_moves = []
+        for move in moves:
+            if move not in seen:
+                unique_moves.append(move)
+                seen.add(move)
+        return unique_moves
 
     def get_bfs_distance(self, start_pos, target_row):
         queue = deque([(start_pos[0], start_pos[1], 0)])
         visited = {start_pos}
-        directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
         while queue:
             x, y, dist = queue.popleft()
             if y == target_row:
                 return dist
 
-            for dx, dy in directions:
+            for dx, dy in ORTHOGONAL_DIRS:
                 nx, ny = x + dx, y + dy
-                if 0 <= nx < self.board_size and 0 <= ny < self.board_size:
+                if self._in_bounds(nx, ny):
                     if not self.has_wall_between(x, y, nx, ny) and (nx, ny) not in visited:
                         visited.add((nx, ny))
                         queue.append((nx, ny, dist + 1))
