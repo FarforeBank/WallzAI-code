@@ -42,6 +42,7 @@ class QuoridorEnv(gym.Env):
         opponent_randomness=0.0,
         smart_observation=True,
         wall_reward=True,
+        wall_candidate_limit=32,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -53,6 +54,7 @@ class QuoridorEnv(gym.Env):
         self.opponent_randomness = float(opponent_randomness)
         self.smart_observation = smart_observation
         self.wall_reward = wall_reward
+        self.wall_candidate_limit = wall_candidate_limit
         self.position_history = []
 
         # 0-11: movement actions, including jumps and diagonals
@@ -152,6 +154,64 @@ class QuoridorEnv(gym.Env):
         obs[8, 1, 1] = self.engine.walls_left[2]
         return obs
 
+    def _wall_action_to_parts(self, action):
+        if H_WALL_OFFSET <= action < V_WALL_OFFSET:
+            idx = action - H_WALL_OFFSET
+            return idx // 8, idx % 8, "H"
+        if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
+            idx = action - V_WALL_OFFSET
+            return idx // 8, idx % 8, "V"
+        return None
+
+    def _nearby_wall_candidates(self):
+        """Return a compact set of wall actions worth considering.
+
+        Checking all 128 walls is very expensive because every legality check runs
+        path-existence BFS for both players. For learning, most useful walls are near
+        the opponent, near our pawn, or around the center race corridor, so we mask a
+        ranked candidate subset in wall stages.
+        """
+        limit = self.wall_candidate_limit
+        if limit is None or limit >= 128:
+            return list(range(H_WALL_OFFSET, TOTAL_ACTIONS))
+        if self.engine.walls_left[1] <= 0:
+            return []
+
+        p1x, p1y = self.engine.p1_pos
+        p2x, p2y = self.engine.p2_pos
+        anchors = [
+            (p2x, p2y),
+            (p2x, min(8, p2y + 1)),
+            (p2x, min(8, p2y + 2)),
+            (p1x, p1y),
+            (4, 4),
+        ]
+
+        actions = set()
+        for ax, ay in anchors:
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    r = max(0, min(7, ay + dy))
+                    c = max(0, min(7, ax + dx))
+                    idx = r * 8 + c
+                    actions.add(H_WALL_OFFSET + idx)
+                    actions.add(V_WALL_OFFSET + idx)
+
+        def score(action):
+            r, c, orientation = self._wall_action_to_parts(action)
+            # Approximate wall center in cell coordinates.
+            wx = c + 0.5
+            wy = r + 0.5
+            near_opponent = abs(wx - p2x) + abs(wy - p2y)
+            near_us = abs(wx - p1x) + abs(wy - p1y)
+            center_bias = abs(wx - 4) * 0.15
+            # Horizontal walls ahead of the opponent often slow vertical progress;
+            # vertical walls around corridors create side traps. Keep both, but rank.
+            orientation_bias = 0.0 if orientation == "H" else 0.08
+            return near_opponent + 0.30 * near_us + center_bias + orientation_bias
+
+        return sorted(actions, key=score)[: int(limit)]
+
     def action_masks(self):
         mask = np.zeros(self.action_space.n, dtype=bool)
 
@@ -165,19 +225,28 @@ class QuoridorEnv(gym.Env):
         if self.move_only:
             return mask
 
-        # 2. Horizontal wall actions
-        for i in range(64):
-            r, c = divmod(i, 8)
-            if self.engine.can_place_wall(1, r, c, "H"):
-                mask[H_WALL_OFFSET + i] = True
-
-        # 3. Vertical wall actions
-        for i in range(64):
-            r, c = divmod(i, 8)
-            if self.engine.can_place_wall(1, r, c, "V"):
-                mask[V_WALL_OFFSET + i] = True
+        # 2. Candidate wall actions only. This is much faster than checking all 128.
+        for action in self._nearby_wall_candidates():
+            r, c, orientation = self._wall_action_to_parts(action)
+            if self.engine.can_place_wall(1, r, c, orientation):
+                mask[action] = True
 
         return mask
+
+    def _is_action_valid(self, action):
+        if action < MOVE_ACTIONS:
+            cx, cy = self.engine.p1_pos
+            dx, dy = MOVES[action]
+            return (cx + dx, cy + dy) in self.engine.get_valid_moves(1)
+
+        if self.move_only:
+            return False
+
+        parts = self._wall_action_to_parts(action)
+        if parts is None:
+            return False
+        r, c, orientation = parts
+        return self.engine.can_place_wall(1, r, c, orientation)
 
     def _move_player_to(self, player_id, target_pos):
         if player_id == 1:
@@ -273,7 +342,7 @@ class QuoridorEnv(gym.Env):
         prev_p1_pos = self.engine.p1_pos
         prev_p1_dist = self.engine.get_bfs_distance(prev_p1_pos, p1_target_row)
         prev_p2_dist = self.engine.get_bfs_distance(self.engine.p2_pos, p2_target_row)
-        valid_action = bool(self.action_masks()[action])
+        valid_action = self._is_action_valid(action)
 
         reward = -0.02  # time pressure: win quickly
 
