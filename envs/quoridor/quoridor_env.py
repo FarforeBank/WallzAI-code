@@ -5,7 +5,25 @@ import numpy as np
 from envs.quoridor.engine import QuoridorEngine
 
 
-MOVES = [(0, -1), (0, 1), (-1, 0), (1, 0)]  # Up, Down, Left, Right
+# 0-3: normal moves, 4-7: straight jumps, 8-11: diagonals around opponent.
+MOVES = [
+    (0, -1),   # 0 UP
+    (0, 1),    # 1 DOWN
+    (-1, 0),   # 2 LEFT
+    (1, 0),    # 3 RIGHT
+    (0, -2),   # 4 JUMP_UP
+    (0, 2),    # 5 JUMP_DOWN
+    (-2, 0),   # 6 JUMP_LEFT
+    (2, 0),    # 7 JUMP_RIGHT
+    (-1, -1),  # 8 UP_LEFT
+    (1, -1),   # 9 UP_RIGHT
+    (-1, 1),   # 10 DOWN_LEFT
+    (1, 1),    # 11 DOWN_RIGHT
+]
+MOVE_ACTIONS = len(MOVES)
+H_WALL_OFFSET = MOVE_ACTIONS
+V_WALL_OFFSET = H_WALL_OFFSET + 64
+TOTAL_ACTIONS = V_WALL_OFFSET + 64
 
 
 class QuoridorEnv(gym.Env):
@@ -30,10 +48,10 @@ class QuoridorEnv(gym.Env):
         self.opponent_randomness = float(opponent_randomness)
         self.position_history = []
 
-        # 0-3: movement actions
-        # 4-67: horizontal walls
-        # 68-131: vertical walls
-        self.action_space = spaces.Discrete(132)
+        # 0-11: movement actions, including jumps and diagonals
+        # 12-75: horizontal walls
+        # 76-139: vertical walls
+        self.action_space = spaces.Discrete(TOTAL_ACTIONS)
 
         # Channel 0 stores board values 0/1/2.
         # Channels 1/2 store walls and a walls-left hint in [0, 10].
@@ -108,13 +126,13 @@ class QuoridorEnv(gym.Env):
         for i in range(64):
             r, c = divmod(i, 8)
             if self.engine.can_place_wall(1, r, c, "H"):
-                mask[i + 4] = True
+                mask[H_WALL_OFFSET + i] = True
 
         # 3. Vertical wall actions
         for i in range(64):
             r, c = divmod(i, 8)
             if self.engine.can_place_wall(1, r, c, "V"):
-                mask[i + 68] = True
+                mask[V_WALL_OFFSET + i] = True
 
         return mask
 
@@ -194,7 +212,7 @@ class QuoridorEnv(gym.Env):
 
         if not valid_action:
             reward -= 1.0
-        elif action < 4:
+        elif action < MOVE_ACTIONS:
             dx, dy = MOVES[action]
             cx, cy = self.engine.p1_pos
             new_pos = (cx + dx, cy + dy)
@@ -202,16 +220,18 @@ class QuoridorEnv(gym.Env):
             new_p1_dist = self.engine.get_bfs_distance(new_pos, p1_target_row)
 
             reward += (prev_p1_dist - new_p1_dist) * 0.30
+            if abs(dx) + abs(dy) >= 2:
+                reward += 0.05  # tiny bonus for using real jump/diagonal rules when useful
             reward += self._repeat_penalty(new_pos)
             self.position_history.append(new_pos)
-        elif action < 68:
-            idx = action - 4
+        elif action < V_WALL_OFFSET:
+            idx = action - H_WALL_OFFSET
             if self.engine.place_wall(1, idx // 8, idx % 8, "H"):
                 reward -= 0.02
             else:
                 reward -= 1.0
         else:
-            idx = action - 68
+            idx = action - V_WALL_OFFSET
             if self.engine.place_wall(1, idx // 8, idx % 8, "V"):
                 reward -= 0.02
             else:
