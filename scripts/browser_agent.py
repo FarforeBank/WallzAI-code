@@ -12,7 +12,14 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from envs.quoridor.quoridor_env import MOVE_ACTIONS, MOVES, QuoridorEnv
+from envs.quoridor.quoridor_env import (
+    H_WALL_OFFSET,
+    MOVE_ACTIONS,
+    MOVES,
+    TOTAL_ACTIONS,
+    V_WALL_OFFSET,
+    QuoridorEnv,
+)
 
 PROFILE_DIR = ROOT_DIR / "browser_profile"
 MODEL_PATH = ROOT_DIR / "models" / "best_model" / "best_model.zip"
@@ -20,7 +27,7 @@ WALLZ_URL = "https://wallz.gg/"
 
 MOVE_DELTAS = {i: delta for i, delta in enumerate(MOVES)}
 ACTION_BY_DELTA = {delta: action for action, delta in MOVE_DELTAS.items()}
-ACTION_NAMES = {
+MOVE_ACTION_NAMES = {
     0: "UP",
     1: "DOWN",
     2: "LEFT",
@@ -38,6 +45,19 @@ RGB_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
 CYCLE_GUARD = True
 DEBUG_WALLS = True
 USE_SYNTHETIC_MOVES = False
+ALLOW_WALL_ACTIONS = True
+
+
+def action_name(action: int) -> str:
+    if action < MOVE_ACTIONS:
+        return MOVE_ACTION_NAMES.get(action, f"MOVE_{action}")
+    if H_WALL_OFFSET <= action < V_WALL_OFFSET:
+        idx = action - H_WALL_OFFSET
+        return f"WALL_H_{idx // 8}_{idx % 8}"
+    if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
+        idx = action - V_WALL_OFFSET
+        return f"WALL_V_{idx // 8}_{idx % 8}"
+    return f"ACTION_{action}"
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
@@ -166,7 +186,8 @@ def _clean_float(value):
 
 class BrowserAgent:
     def __init__(self):
-        self.local_env = QuoridorEnv()
+        # Browser play should use the same smart observation / wall-capable env as Stage 5.
+        self.local_env = QuoridorEnv(wall_candidate_limit=40)
         self.obs, _ = self.local_env.reset()
         self.position_history = []
         self.own_color_key = None
@@ -178,8 +199,8 @@ class BrowserAgent:
                 self.model = load_maskable_model(MODEL_PATH, self.local_env)
                 print(f"[System] Модель загружена: {MODEL_PATH}")
             except Exception as exc:
-                print(f"[System] Старая модель несовместима с real-move action space: {type(exc).__name__}")
-                print("[System] Сначала запусти python scripts/train.py для Stage 3.")
+                print(f"[System] Модель несовместима с текущим env: {type(exc).__name__}")
+                print("[System] Сначала дообучи актуальную smart-модель через python scripts/train.py --stage 5")
                 self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
         else:
             self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
@@ -300,7 +321,7 @@ class BrowserAgent:
     def _cell_point(self, pos, centers):
         xs, ys = centers
         x, y = pos
-        return {"x": xs[x], "y": ys[y], "r": 0.0, "synthetic": True}
+        return {"x": xs[x], "y": ys[y], "r": 0.0, "synthetic": True, "kind": "move"}
 
     def _wall_index(self, item, centers):
         xs, ys = centers
@@ -430,7 +451,6 @@ class BrowserAgent:
             if same_color:
                 own = min(same_color, key=distance_to_last)
             else:
-                # Color detection can fail for a frame; use nearest-to-last before falling back.
                 own = min(pawns, key=distance_to_last) if self.last_own_screen_xy else max(pawns, key=lambda circle: (circle["y"], circle["r"]))
 
         self.last_own_screen_xy = (own["x"], own["y"])
@@ -476,6 +496,7 @@ class BrowserAgent:
             delta = (dot_pos[0] - own_pos[0], dot_pos[1] - own_pos[1])
             action = ACTION_BY_DELTA.get(delta)
             if action is not None:
+                circle["kind"] = "move"
                 options[action] = circle
 
         if USE_SYNTHETIC_MOVES and options:
@@ -487,12 +508,60 @@ class BrowserAgent:
 
         return options
 
+    def _wall_click_point(self, action, centers):
+        xs, ys = centers
+        if len(xs) < 9 or len(ys) < 9:
+            return None
+
+        if H_WALL_OFFSET <= action < V_WALL_OFFSET:
+            idx = action - H_WALL_OFFSET
+            r, c = divmod(idx, 8)
+            # Avoid the exact H/V crossing center; click inside the horizontal bar.
+            gap_x = xs[c + 1] - xs[c]
+            x = xs[c] + gap_x * 0.25
+            y = (ys[r] + ys[r + 1]) / 2.0
+            return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "H", "wall_rc": (r, c)}
+
+        if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
+            idx = action - V_WALL_OFFSET
+            r, c = divmod(idx, 8)
+            # Avoid the exact H/V crossing center; click inside the vertical bar.
+            gap_y = ys[r + 1] - ys[r]
+            x = (xs[c] + xs[c + 1]) / 2.0
+            y = ys[r] + gap_y * 0.25
+            return {"x": x, "y": y, "r": 0.0, "synthetic": False, "kind": "wall", "orientation": "V", "wall_rc": (r, c)}
+
+        return None
+
+    def _wall_action_options(self, centers):
+        if not ALLOW_WALL_ACTIONS:
+            return {}
+
+        masks = self.local_env.action_masks()
+        options = {}
+        for action in range(MOVE_ACTIONS, TOTAL_ACTIONS):
+            if not masks[action]:
+                continue
+            target = self._wall_click_point(action, centers)
+            if target is not None:
+                options[action] = target
+        return options
+
+    def _screen_action_options(self, own, state, centers):
+        options = self._screen_move_options(own, state, centers)
+        options.update(self._wall_action_options(centers))
+        return options
+
     def _target_pos_for_action(self, p1_pos, action):
         dx, dy = MOVE_DELTAS[action]
         return p1_pos[0] + dx, p1_pos[1] + dy
 
-    def _choose_action(self, predicted_action, move_options, p1_pos):
-        if not CYCLE_GUARD or predicted_action not in move_options:
+    def _choose_action(self, predicted_action, action_options, p1_pos):
+        # Cycle guard is only for pawn moves. Wall actions are already legal and
+        # should not be overridden by a movement anti-loop rule.
+        if predicted_action >= MOVE_ACTIONS:
+            return predicted_action, False
+        if not CYCLE_GUARD or predicted_action not in action_options:
             return predicted_action, False
 
         predicted_pos = self._target_pos_for_action(p1_pos, predicted_action)
@@ -509,15 +578,18 @@ class BrowserAgent:
         if not immediate_backtrack and not short_loop:
             return predicted_action, False
 
+        move_actions = [action for action in action_options if action < MOVE_ACTIONS]
+        if not move_actions:
+            return predicted_action, False
+
         def score(action):
             target_pos = self._target_pos_for_action(p1_pos, action)
             dist = self.local_env.engine.get_bfs_distance(target_pos, 0)
             repeat = 2.5 if target_pos in recent else 0.0
-            backward = 2.0 if target_pos[1] > p1_pos[1] else 0.0
             side = abs(target_pos[0] - 4) * 0.04
-            return dist + repeat + backward + side
+            return dist + repeat + side
 
-        best_action = min(move_options.keys(), key=score)
+        best_action = min(move_actions, key=score)
         return best_action, best_action != predicted_action
 
     def _walls_text(self, wall_counts):
@@ -548,38 +620,49 @@ class BrowserAgent:
                     time.sleep(1.0)
                     continue
 
-                move_options = self._screen_move_options(own, state, centers)
-                if not move_options:
+                action_options = self._screen_action_options(own, state, centers)
+                if not action_options:
                     print(f"[Ожидание] Жду свой ход | P1={p1_pos} P2={p2_pos} | {walls_text}")
                     time.sleep(0.7)
                     continue
 
-                masks = self.local_env.action_masks()
-                masks[:] = False
-                for action in move_options:
+                masks = np.zeros(self.local_env.action_space.n, dtype=bool)
+                for action in action_options:
                     masks[action] = True
-                masks[MOVE_ACTIONS:] = False
 
                 predicted_action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
                 predicted_action = int(predicted_action)
-                action, overridden = self._choose_action(predicted_action, move_options, p1_pos)
+                action, overridden = self._choose_action(predicted_action, action_options, p1_pos)
 
-                target = move_options.get(action)
+                target = action_options.get(action)
                 if target is None:
-                    print(f"[Пропуск] Недоступный ход модели: {action} | options={sorted(move_options)}")
+                    print(f"[Пропуск] Недоступное действие модели: {action} {action_name(action)} | options={sorted(action_options)}")
                     time.sleep(0.5)
                     continue
 
-                target_pos = self._target_pos_for_action(p1_pos, action)
-                source = "synthetic" if target.get("synthetic") else "screen"
-                guard = f" | guard {ACTION_NAMES.get(predicted_action)}->{ACTION_NAMES.get(action)}" if overridden else ""
-                print(
-                    f"[Действие] P1={p1_pos} P2={p2_pos} | {walls_text} | "
-                    f"ход {action} {ACTION_NAMES.get(action)} -> {target_pos} | {source} | клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
-                )
+                source = "synthetic" if target.get("synthetic") else target.get("kind", "screen")
+                guard = f" | guard {action_name(predicted_action)}->{action_name(action)}" if overridden else ""
+
+                if action < MOVE_ACTIONS:
+                    target_pos = self._target_pos_for_action(p1_pos, action)
+                    print(
+                        f"[Действие] P1={p1_pos} P2={p2_pos} | {walls_text} | "
+                        f"ход {action} {action_name(action)} -> {target_pos} | {source} | "
+                        f"клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
+                    )
+                else:
+                    print(
+                        f"[Стена] P1={p1_pos} P2={p2_pos} | {walls_text} | "
+                        f"действие {action} {action_name(action)} | {source} | "
+                        f"клик ({target['x']:.1f}, {target['y']:.1f})"
+                    )
+
+                page.mouse.move(target["x"], target["y"])
                 page.mouse.click(target["x"], target["y"])
-                self.position_history.append(target_pos)
-                self.position_history = self.position_history[-12:]
+
+                if action < MOVE_ACTIONS:
+                    self.position_history.append(self._target_pos_for_action(p1_pos, action))
+                    self.position_history = self.position_history[-12:]
                 time.sleep(1.2)
             except KeyboardInterrupt:
                 print("\n[System] Остановлено пользователем.")
