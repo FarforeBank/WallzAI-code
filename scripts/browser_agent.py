@@ -28,6 +28,7 @@ ACTION_BY_DELTA = {delta: action for action, delta in MOVE_DELTAS.items()}
 ACTION_NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
 RGB_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
 CYCLE_GUARD = True
+DEBUG_WALLS = True
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
@@ -142,6 +143,18 @@ def _median_gap(centers, default=70.0):
     return float(np.median(gaps))
 
 
+def _clean_float(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
 class BrowserAgent:
     def __init__(self):
         self.local_env = QuoridorEnv()
@@ -149,6 +162,7 @@ class BrowserAgent:
         self.position_history = []
         self.own_color_key = None
         self.last_own_screen_xy = None
+        self.wall_debug = ""
 
         if MODEL_PATH.exists():
             self.model = load_maskable_model(MODEL_PATH, self.local_env)
@@ -195,6 +209,13 @@ class BrowserAgent:
                 const svg = el.tagName.toLowerCase() === 'svg' ? el : el.querySelector('svg');
                 const source = svg || el;
 
+                function numAttr(node, name) {
+                    const value = node.getAttribute(name);
+                    if (value === null) return null;
+                    const parsed = Number(value);
+                    return Number.isFinite(parsed) ? parsed : null;
+                }
+
                 function readNode(node) {
                     const rect = node.getBoundingClientRect();
                     const style = window.getComputedStyle(node);
@@ -206,7 +227,15 @@ class BrowserAgent:
                         w: rect.width,
                         h: rect.height,
                         r: Math.max(rect.width, rect.height) / 2,
+                        rawX: numAttr(node, 'x'),
+                        rawY: numAttr(node, 'y'),
+                        rawW: numAttr(node, 'width'),
+                        rawH: numAttr(node, 'height'),
+                        rawCx: numAttr(node, 'cx'),
+                        rawCy: numAttr(node, 'cy'),
+                        rawR: numAttr(node, 'r'),
                         fill: style.fill || node.getAttribute('fill') || '',
+                        attrFill: node.getAttribute('fill') || '',
                         stroke: style.stroke || node.getAttribute('stroke') || '',
                         opacity: Number.isFinite(opacity) ? opacity : 1,
                         className: node.getAttribute('class') || '',
@@ -216,13 +245,13 @@ class BrowserAgent:
                 const all = Array.from(source.querySelectorAll('*'))
                     .map(readNode)
                     .filter((item) => (
-                        item.w > 0 && item.h > 0 &&
+                        (Math.max(item.w, item.h) > 3 || Math.max(item.rawW || 0, item.rawH || 0, item.rawR || 0) > 3) &&
                         Number.isFinite(item.x) && Number.isFinite(item.y) &&
                         item.opacity > 0.03 && item.tag !== 'svg'
                     ));
 
                 const circles = all.filter((item) => item.tag === 'circle' && item.r > 0);
-                const shapes = all.filter((item) => item.tag !== 'circle' && item.w > 3 && item.h > 3);
+                const shapes = all.filter((item) => item.tag !== 'circle');
                 return { circles, shapes, rects: shapes };
             }
             """
@@ -232,8 +261,12 @@ class BrowserAgent:
         square_rects = []
         for rect in state["shapes"]:
             w, h = rect["w"], rect["h"]
+            raw_w = rect.get("rawW")
+            raw_h = rect.get("rawH")
             ratio = w / h if h else 0
-            if 0.65 <= ratio <= 1.55 and 25 <= w <= 140 and 25 <= h <= 140:
+            raw_cell = raw_w == 60 and raw_h == 60
+            screen_cell = 0.65 <= ratio <= 1.55 and 25 <= w <= 140 and 25 <= h <= 140
+            if raw_cell or screen_cell:
                 square_rects.append(rect)
 
         if len(square_rects) >= 20:
@@ -263,6 +296,35 @@ class BrowserAgent:
         r = _nearest_index(item["y"], yb)
         return max(0, min(7, r)), max(0, min(7, c))
 
+    def _svg_wall_from_item(self, item):
+        raw_x = _clean_float(item.get("rawX"))
+        raw_y = _clean_float(item.get("rawY"))
+        raw_w = _clean_float(item.get("rawW"))
+        raw_h = _clean_float(item.get("rawH"))
+        if raw_x is None or raw_y is None or raw_w is None or raw_h is None:
+            return None
+
+        # Wallz renders placed walls directly in board SVG coordinates:
+        # vertical:   x=<boundary-6>, y=<top cell y>, width=12, height=132
+        # horizontal: x=<left cell x>, y=<boundary-6>, width=132, height=12
+        is_horizontal = abs(raw_w - 132) <= 18 and abs(raw_h - 12) <= 8
+        is_vertical = abs(raw_w - 12) <= 8 and abs(raw_h - 132) <= 18
+        if not is_horizontal and not is_vertical:
+            return None
+
+        fill_text = f"{item.get('attrFill', '')} {item.get('fill', '')}".lower()
+        if "color-p" not in fill_text and "color-wall" not in fill_text:
+            return None
+
+        if is_horizontal:
+            c = round(raw_x / 72)
+            r = round(((raw_y + raw_h / 2) - 66) / 72)
+            return "H", max(0, min(7, r)), max(0, min(7, c))
+
+        c = round(((raw_x + raw_w / 2) - 66) / 72)
+        r = round(raw_y / 72)
+        return "V", max(0, min(7, r)), max(0, min(7, c))
+
     def _is_wall_bar(self, item, centers):
         if item.get("tag") == "circle":
             return None
@@ -281,13 +343,13 @@ class BrowserAgent:
         if squareish and w >= gap * 0.45 and h >= gap * 0.45:
             return None
 
-        if ratio < 1.8:
+        if ratio < 1.7:
             return None
-        if short_side > gap * 0.65:
+        if short_side > gap * 0.72:
             return None
-        if long_side < gap * 0.45:
+        if long_side < gap * 0.38:
             return None
-        if long_side > gap * 3.2:
+        if long_side > gap * 3.5:
             return None
 
         color_text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
@@ -304,11 +366,15 @@ class BrowserAgent:
         horizontal = set()
         vertical = set()
         for item in state["shapes"]:
-            orientation = self._is_wall_bar(item, centers)
-            if orientation is None:
-                continue
+            parsed = self._svg_wall_from_item(item)
+            if parsed is not None:
+                orientation, r, c = parsed
+            else:
+                orientation = self._is_wall_bar(item, centers)
+                if orientation is None:
+                    continue
+                r, c = self._wall_index(item, centers)
 
-            r, c = self._wall_index(item, centers)
             if orientation == "H":
                 horizontal.add((r, c))
             else:
@@ -319,6 +385,7 @@ class BrowserAgent:
         for r, c in vertical:
             engine.vertical_walls[r, c] = True
 
+        self.wall_debug = f"H={sorted(horizontal)} V={sorted(vertical)}" if DEBUG_WALLS else ""
         return len(horizontal), len(vertical)
 
     def _pick_pawns(self, state):
@@ -443,6 +510,10 @@ class BrowserAgent:
         best_action = min(move_options.keys(), key=score)
         return best_action, best_action != predicted_action
 
+    def _walls_text(self, wall_counts):
+        debug = f" | {self.wall_debug}" if DEBUG_WALLS and self.wall_debug else ""
+        return f"walls H/V={wall_counts}{debug}"
+
     def _play_loop(self, page, board):
         while True:
             try:
@@ -460,15 +531,16 @@ class BrowserAgent:
                     continue
 
                 p1_pos, p2_pos, wall_counts = self._sync_env_from_screen(own, opponent, state, centers)
+                walls_text = self._walls_text(wall_counts)
                 if p1_pos[1] == 0 or p2_pos[1] == 8:
-                    print(f"[Ожидание] Матч, похоже, завершён | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
+                    print(f"[Ожидание] Матч, похоже, завершён | P1={p1_pos} P2={p2_pos} | {walls_text}")
                     self._reset_identity()
                     time.sleep(1.0)
                     continue
 
                 move_options = self._screen_move_options(own, state, centers)
                 if not move_options:
-                    print(f"[Ожидание] Жду свой ход | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
+                    print(f"[Ожидание] Жду свой ход | P1={p1_pos} P2={p2_pos} | {walls_text}")
                     time.sleep(0.7)
                     continue
 
@@ -492,7 +564,7 @@ class BrowserAgent:
                 source = "synthetic" if target.get("synthetic") else "screen"
                 guard = f" | guard {ACTION_NAMES.get(predicted_action)}->{ACTION_NAMES.get(action)}" if overridden else ""
                 print(
-                    f"[Действие] P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts} | "
+                    f"[Действие] P1={p1_pos} P2={p2_pos} | {walls_text} | "
                     f"ход {action} -> {target_pos} | {source} | клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
                 )
                 page.mouse.click(target["x"], target["y"])
