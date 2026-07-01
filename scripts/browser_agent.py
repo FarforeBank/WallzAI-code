@@ -12,20 +12,28 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from envs.quoridor.quoridor_env import QuoridorEnv
+from envs.quoridor.quoridor_env import MOVE_ACTIONS, MOVES, QuoridorEnv
 
 PROFILE_DIR = ROOT_DIR / "browser_profile"
 MODEL_PATH = ROOT_DIR / "models" / "best_model" / "best_model.zip"
 WALLZ_URL = "https://wallz.gg/"
 
-MOVE_DELTAS = {
-    0: (0, -1),   # Up
-    1: (0, 1),    # Down
-    2: (-1, 0),   # Left
-    3: (1, 0),    # Right
-}
+MOVE_DELTAS = {i: delta for i, delta in enumerate(MOVES)}
 ACTION_BY_DELTA = {delta: action for action, delta in MOVE_DELTAS.items()}
-ACTION_NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
+ACTION_NAMES = {
+    0: "UP",
+    1: "DOWN",
+    2: "LEFT",
+    3: "RIGHT",
+    4: "JUMP_UP",
+    5: "JUMP_DOWN",
+    6: "JUMP_LEFT",
+    7: "JUMP_RIGHT",
+    8: "UP_LEFT",
+    9: "UP_RIGHT",
+    10: "DOWN_LEFT",
+    11: "DOWN_RIGHT",
+}
 RGB_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
 CYCLE_GUARD = True
 DEBUG_WALLS = True
@@ -33,7 +41,7 @@ USE_SYNTHETIC_MOVES = False
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
-    """Load old checkpoints even if only Box bounds changed."""
+    """Load checkpoints only when compatible with the current action space."""
     return MaskablePPO.load(
         str(model_path),
         env=env,
@@ -166,8 +174,13 @@ class BrowserAgent:
         self.wall_debug = ""
 
         if MODEL_PATH.exists():
-            self.model = load_maskable_model(MODEL_PATH, self.local_env)
-            print(f"[System] Модель загружена: {MODEL_PATH}")
+            try:
+                self.model = load_maskable_model(MODEL_PATH, self.local_env)
+                print(f"[System] Модель загружена: {MODEL_PATH}")
+            except Exception as exc:
+                print(f"[System] Старая модель несовместима с real-move action space: {type(exc).__name__}")
+                print("[System] Сначала запусти python scripts/train.py для Stage 3.")
+                self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
         else:
             self.model = MaskablePPO("MlpPolicy", self.local_env, device="cpu")
             print("[System] Модель не найдена, используются случайные веса.")
@@ -545,7 +558,7 @@ class BrowserAgent:
                 masks[:] = False
                 for action in move_options:
                     masks[action] = True
-                masks[4:] = False
+                masks[MOVE_ACTIONS:] = False
 
                 predicted_action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
                 predicted_action = int(predicted_action)
@@ -562,7 +575,7 @@ class BrowserAgent:
                 guard = f" | guard {ACTION_NAMES.get(predicted_action)}->{ACTION_NAMES.get(action)}" if overridden else ""
                 print(
                     f"[Действие] P1={p1_pos} P2={p2_pos} | {walls_text} | "
-                    f"ход {action} -> {target_pos} | {source} | клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
+                    f"ход {action} {ACTION_NAMES.get(action)} -> {target_pos} | {source} | клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
                 )
                 page.mouse.click(target["x"], target["y"])
                 self.position_history.append(target_pos)
