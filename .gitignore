@@ -6,6 +6,8 @@ bin-release/
 [Bb]in/
 browser_profile
 venv/
+models
+__pycache__
 
 # Other files and folders
 .settings/
