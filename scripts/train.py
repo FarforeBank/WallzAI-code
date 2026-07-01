@@ -20,6 +20,7 @@ MOVE_ONLY = True
 REPEAT_PENALTY = True
 OPPONENT_POLICY = "greedy"
 OPPONENT_RANDOMNESS = 0.10
+SHOW_PROGRESS_BAR = True
 
 
 def make_quoridor_env():
@@ -65,7 +66,8 @@ def main():
         "Curriculum: "
         f"random_walls={RANDOM_WALLS_RANGE}, "
         f"move_only={MOVE_ONLY}, repeat_penalty={REPEAT_PENALTY}, "
-        f"opponent={OPPONENT_POLICY}, opponent_randomness={OPPONENT_RANDOMNESS}"
+        f"opponent={OPPONENT_POLICY}, opponent_randomness={OPPONENT_RANDOMNESS}, "
+        f"progress_bar={SHOW_PROGRESS_BAR}"
     )
 
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)], start_method="spawn")
@@ -108,7 +110,11 @@ def main():
 
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
-        model.learn(total_timesteps=3_000_000, callback=eval_callback, progress_bar=False)
+        model.learn(
+            total_timesteps=3_000_000,
+            callback=eval_callback,
+            progress_bar=SHOW_PROGRESS_BAR,
+        )
     except KeyboardInterrupt:
         print("\nОбучение прервано пользователем. Сохраняем прогресс...")
         model.save(str(model_path))
