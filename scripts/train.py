@@ -19,14 +19,17 @@ if str(ROOT_DIR) not in sys.path:
 
 from envs.quoridor.quoridor_env import QuoridorEnv
 
-# Stage 2 curriculum: random walls + moving opponent.
-# The agent still learns movement only; wall placement comes after it can race reliably.
+# Stage 3 curriculum: real movement rules.
+# Action space now includes normal moves, jumps, and diagonals around the opponent.
+# Because the action-space size changed, the old 132-action checkpoint is backed up
+# and training starts from a fresh 140-action policy.
 RANDOM_WALLS_RANGE = (0, 6)
 MOVE_ONLY = True
 REPEAT_PENALTY = True
 OPPONENT_POLICY = "greedy"
 OPPONENT_RANDOMNESS = 0.10
 SHOW_PROGRESS_BAR = True
+FORCE_NEW_MODEL_FOR_REAL_MOVES = True
 
 
 def make_quoridor_env():
@@ -53,7 +56,7 @@ def make_eval_env():
 
 
 def load_maskable_model(model_path: Path, env):
-    """Continue old checkpoints even if only Box bounds changed."""
+    """Continue compatible checkpoints even if only Box bounds changed."""
     return MaskablePPO.load(
         str(model_path),
         env=env,
@@ -70,6 +73,19 @@ def save_model_safely(model, model_path: Path, reason: str):
     model.save(str(model_path))
 
 
+def create_new_model(vec_env):
+    return MaskablePPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=1,
+        device="cpu",
+        learning_rate=5e-5,
+        n_steps=1024,
+        batch_size=512,
+        clip_range=0.1,
+    )
+
+
 def main():
     num_envs = max(1, min(16, os.cpu_count() or 1))
     print(f"Инициализация {num_envs} параллельных сред...")
@@ -78,7 +94,7 @@ def main():
         f"random_walls={RANDOM_WALLS_RANGE}, "
         f"move_only={MOVE_ONLY}, repeat_penalty={REPEAT_PENALTY}, "
         f"opponent={OPPONENT_POLICY}, opponent_randomness={OPPONENT_RANDOMNESS}, "
-        f"progress_bar={SHOW_PROGRESS_BAR}"
+        f"progress_bar={SHOW_PROGRESS_BAR}, real_moves=True"
     )
 
     vec_env = SubprocVecEnv([make_env(i) for i in range(num_envs)], start_method="spawn")
@@ -101,23 +117,21 @@ def main():
     )
 
     if model_path.exists():
-        backup_path = save_path / "base_before_greedy_opponent.zip"
+        backup_path = save_path / "base_before_real_moves.zip"
         if not backup_path.exists():
             backup_path.write_bytes(model_path.read_bytes())
-            print(f"Сохранил backup старой модели: {backup_path}")
-        print("Найдена существующая модель. Продолжаем обучение против greedy opponent...")
-        model = load_maskable_model(model_path, vec_env)
+            print(f"Сохранил backup старой 132-action модели: {backup_path}")
+
+    if FORCE_NEW_MODEL_FOR_REAL_MOVES or not model_path.exists():
+        print("Stage 3: action space изменился. Начинаем новую 140-action модель...")
+        model = create_new_model(vec_env)
     else:
-        print("Начинаем обучение с нуля...")
-        model = MaskablePPO(
-            "MlpPolicy",
-            vec_env,
-            verbose=1,
-            device="cpu",
-            learning_rate=5e-5,
-            n_steps=1024,
-            batch_size=512,
-        )
+        print("Найдена совместимая модель. Продолжаем обучение...")
+        try:
+            model = load_maskable_model(model_path, vec_env)
+        except Exception as exc:
+            print(f"Не удалось загрузить старую модель ({type(exc).__name__}). Стартуем с нуля.")
+            model = create_new_model(vec_env)
 
     print("Запуск обучения (останови через Ctrl+C)...")
     try:
