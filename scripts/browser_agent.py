@@ -1,18 +1,16 @@
-import os
 import re
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+from sb3_contrib import MaskablePPO
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
-from sb3_contrib import MaskablePPO
 
 from envs.quoridor.quoridor_env import QuoridorEnv
 
@@ -27,7 +25,9 @@ MOVE_DELTAS = {
     3: (1, 0),    # Right
 }
 ACTION_BY_DELTA = {delta: action for action, delta in MOVE_DELTAS.items()}
+ACTION_NAMES = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT"}
 RGB_RE = re.compile(r"rgba?\((\d+),\s*(\d+),\s*(\d+)")
+CYCLE_GUARD = True
 
 
 def load_maskable_model(model_path: Path, env: QuoridorEnv):
@@ -134,6 +134,7 @@ class BrowserAgent:
     def __init__(self):
         self.local_env = QuoridorEnv()
         self.obs, _ = self.local_env.reset()
+        self.position_history = []
 
         if MODEL_PATH.exists():
             self.model = load_maskable_model(MODEL_PATH, self.local_env)
@@ -147,7 +148,7 @@ class BrowserAgent:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=False,
-                slow_mo=200,
+                slow_mo=120,
             )
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(WALLZ_URL, wait_until="domcontentloaded")
@@ -159,13 +160,19 @@ class BrowserAgent:
                 board.wait_for(state="visible", timeout=40_000)
             except PlaywrightTimeoutError:
                 print("[Ошибка] Доска не найдена. Проверь, что матч запущен.")
-                context.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
                 return
 
             try:
                 self._play_loop(page, board)
             finally:
-                context.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
     def _read_screen_state(self, board):
         return board.evaluate(
@@ -174,44 +181,45 @@ class BrowserAgent:
                 const svg = el.tagName.toLowerCase() === 'svg' ? el : el.querySelector('svg');
                 const source = svg || el;
 
-                const circles = Array.from(source.querySelectorAll('circle')).map((circle) => {
-                    const rect = circle.getBoundingClientRect();
-                    const style = window.getComputedStyle(circle);
+                function readNode(node) {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    const opacity = Number(style.opacity || 1);
                     return {
-                        x: rect.x + rect.width / 2,
-                        y: rect.y + rect.height / 2,
-                        r: Math.max(rect.width, rect.height) / 2,
-                        fill: style.fill || circle.getAttribute('fill') || '',
-                        stroke: style.stroke || circle.getAttribute('stroke') || '',
-                        className: circle.getAttribute('class') || '',
-                    };
-                }).filter((circle) => circle.r > 0 && Number.isFinite(circle.x) && Number.isFinite(circle.y));
-
-                const rects = Array.from(source.querySelectorAll('rect')).map((rectEl) => {
-                    const rect = rectEl.getBoundingClientRect();
-                    const style = window.getComputedStyle(rectEl);
-                    return {
+                        tag: node.tagName.toLowerCase(),
                         x: rect.x + rect.width / 2,
                         y: rect.y + rect.height / 2,
                         w: rect.width,
                         h: rect.height,
-                        fill: style.fill || rectEl.getAttribute('fill') || '',
-                        stroke: style.stroke || rectEl.getAttribute('stroke') || '',
-                        className: rectEl.getAttribute('class') || '',
+                        r: Math.max(rect.width, rect.height) / 2,
+                        fill: style.fill || node.getAttribute('fill') || '',
+                        stroke: style.stroke || node.getAttribute('stroke') || '',
+                        opacity: Number.isFinite(opacity) ? opacity : 1,
+                        className: node.getAttribute('class') || '',
                     };
-                }).filter((rect) => rect.w > 4 && rect.h > 4 && Number.isFinite(rect.x) && Number.isFinite(rect.y));
+                }
 
-                return { circles, rects };
+                const all = Array.from(source.querySelectorAll('*'))
+                    .map(readNode)
+                    .filter((item) => (
+                        item.w > 0 && item.h > 0 &&
+                        Number.isFinite(item.x) && Number.isFinite(item.y) &&
+                        item.opacity > 0.03 && item.tag !== 'svg'
+                    ));
+
+                const circles = all.filter((item) => item.tag === 'circle' && item.r > 0);
+                const shapes = all.filter((item) => item.tag !== 'circle' && item.w > 3 && item.h > 3);
+                return { circles, shapes, rects: shapes };
             }
             """
         )
 
     def _cell_centers(self, state):
         square_rects = []
-        for rect in state["rects"]:
+        for rect in state["shapes"]:
             w, h = rect["w"], rect["h"]
             ratio = w / h if h else 0
-            if 0.65 <= ratio <= 1.55 and w >= 25 and h >= 25:
+            if 0.65 <= ratio <= 1.55 and 25 <= w <= 140 and 25 <= h <= 140:
                 square_rects.append(rect)
 
         if len(square_rects) >= 20:
@@ -228,6 +236,11 @@ class BrowserAgent:
         xs, ys = centers
         return _nearest_index(item["x"], xs), _nearest_index(item["y"], ys)
 
+    def _cell_point(self, pos, centers):
+        xs, ys = centers
+        x, y = pos
+        return {"x": xs[x], "y": ys[y], "r": 0.0, "synthetic": True}
+
     def _wall_index(self, item, centers):
         xs, ys = centers
         xb = _boundaries(xs)
@@ -236,46 +249,66 @@ class BrowserAgent:
         r = _nearest_index(item["y"], yb)
         return max(0, min(7, r)), max(0, min(7, c))
 
-    def _is_wall_rect(self, rect, centers):
+    def _is_wall_bar(self, item, centers):
+        if item.get("tag") == "circle":
+            return None
+
         xs, ys = centers
+        if len(xs) < 2 or len(ys) < 2:
+            return None
+
         gap = min(_median_gap(xs), _median_gap(ys))
-        w, h = rect["w"], rect["h"]
+        w, h = item["w"], item["h"]
+        long_side = max(w, h)
+        short_side = min(w, h)
+        ratio = long_side / max(1.0, short_side)
 
-        is_vertical = h >= gap * 1.25 and h >= w * 2.2 and w <= gap * 0.45
-        is_horizontal = w >= gap * 1.25 and w >= h * 2.2 and h <= gap * 0.45
-        if not (is_vertical or is_horizontal):
+        # Exclude normal cell squares / board background.
+        squareish = 0.65 <= (w / h if h else 0) <= 1.55
+        if squareish and w >= gap * 0.45 and h >= gap * 0.45:
             return None
 
-        # Walls can be teal/red/gray depending on owner and history. We mostly rely on geometry,
-        # but ignore very dark background pieces by requiring a visible fill/stroke token or color.
-        color_text = f"{rect.get('fill', '')} {rect.get('stroke', '')} {rect.get('className', '')}".lower()
-        has_color = bool(color_text.strip()) and "none" not in color_text
-        if not has_color:
+        # Placed walls are long thin bars. Wallz may render them as rect/path/line,
+        # so geometry is more reliable than tag name.
+        if ratio < 1.8:
+            return None
+        if short_side > gap * 0.65:
+            return None
+        if long_side < gap * 0.45:
+            return None
+        if long_side > gap * 3.2:
             return None
 
-        return "V" if is_vertical else "H"
+        color_text = f"{item.get('fill', '')} {item.get('stroke', '')} {item.get('className', '')}".lower()
+        if "transparent" in color_text or "none none" in color_text:
+            return None
+
+        return "H" if w >= h else "V"
 
     def _sync_walls_from_screen(self, state, centers):
         engine = self.local_env.engine
         engine.horizontal_walls[:, :] = False
         engine.vertical_walls[:, :] = False
 
-        horizontal = 0
-        vertical = 0
-        for rect in state["rects"]:
-            orientation = self._is_wall_rect(rect, centers)
+        horizontal = set()
+        vertical = set()
+        for item in state["shapes"]:
+            orientation = self._is_wall_bar(item, centers)
             if orientation is None:
                 continue
 
-            r, c = self._wall_index(rect, centers)
+            r, c = self._wall_index(item, centers)
             if orientation == "H":
-                engine.horizontal_walls[r, c] = True
-                horizontal += 1
+                horizontal.add((r, c))
             else:
-                engine.vertical_walls[r, c] = True
-                vertical += 1
+                vertical.add((r, c))
 
-        return horizontal, vertical
+        for r, c in horizontal:
+            engine.horizontal_walls[r, c] = True
+        for r, c in vertical:
+            engine.vertical_walls[r, c] = True
+
+        return len(horizontal), len(vertical)
 
     def _pick_pawns(self, state):
         circles = state["circles"]
@@ -337,7 +370,38 @@ class BrowserAgent:
             if action is not None:
                 options[action] = circle
 
+        # Fallback: sometimes Wallz does not expose the final/top legal dot as a teal circle.
+        # Add locally-valid move targets as synthetic cell-center clicks.
+        valid_moves = self.local_env.engine.get_valid_moves(1)
+        for action, (dx, dy) in MOVE_DELTAS.items():
+            target_pos = (own_pos[0] + dx, own_pos[1] + dy)
+            if target_pos in valid_moves and action not in options:
+                options[action] = self._cell_point(target_pos, centers)
+
         return options
+
+    def _target_pos_for_action(self, p1_pos, action):
+        dx, dy = MOVE_DELTAS[action]
+        return p1_pos[0] + dx, p1_pos[1] + dy
+
+    def _choose_action(self, predicted_action, move_options, p1_pos):
+        if not CYCLE_GUARD or predicted_action not in move_options:
+            return predicted_action, False
+
+        predicted_pos = self._target_pos_for_action(p1_pos, predicted_action)
+        recent = set(self.position_history[-4:])
+        if predicted_pos not in recent:
+            return predicted_action, False
+
+        def score(action):
+            target_pos = self._target_pos_for_action(p1_pos, action)
+            dist = self.local_env.engine.get_bfs_distance(target_pos, 0)
+            repeat = 3.0 if target_pos in recent else 0.0
+            side = abs(target_pos[0] - 4) * 0.05
+            return dist + repeat + side
+
+        best_action = min(move_options.keys(), key=score)
+        return best_action, best_action != predicted_action
 
     def _play_loop(self, page, board):
         while True:
@@ -356,8 +420,13 @@ class BrowserAgent:
                     continue
 
                 p1_pos, p2_pos, wall_counts = self._sync_env_from_screen(own, opponent, state, centers)
-                move_options = self._screen_move_options(own, state, centers)
+                if p1_pos[1] == 0 or p2_pos[1] == 8:
+                    print(f"[Ожидание] Матч, похоже, завершён | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
+                    self.position_history.clear()
+                    time.sleep(1.0)
+                    continue
 
+                move_options = self._screen_move_options(own, state, centers)
                 if not move_options:
                     print(f"[Ожидание] Нет доступных точек хода | P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts}")
                     time.sleep(0.7)
@@ -369,8 +438,9 @@ class BrowserAgent:
                     masks[action] = True
                 masks[4:] = False
 
-                action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
-                action = int(action)
+                predicted_action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
+                predicted_action = int(predicted_action)
+                action, overridden = self._choose_action(predicted_action, move_options, p1_pos)
 
                 target = move_options.get(action)
                 if target is None:
@@ -378,12 +448,16 @@ class BrowserAgent:
                     time.sleep(0.5)
                     continue
 
-                target_pos = self._grid_pos(target, centers)
+                target_pos = self._target_pos_for_action(p1_pos, action)
+                source = "synthetic" if target.get("synthetic") else "screen"
+                guard = f" | guard {ACTION_NAMES.get(predicted_action)}->{ACTION_NAMES.get(action)}" if overridden else ""
                 print(
                     f"[Действие] P1={p1_pos} P2={p2_pos} | walls H/V={wall_counts} | "
-                    f"ход {action} -> {target_pos} | клик ({target['x']:.1f}, {target['y']:.1f})"
+                    f"ход {action} -> {target_pos} | {source} | клик ({target['x']:.1f}, {target['y']:.1f}){guard}"
                 )
                 page.mouse.click(target["x"], target["y"])
+                self.position_history.append(target_pos)
+                self.position_history = self.position_history[-12:]
                 time.sleep(1.2)
             except KeyboardInterrupt:
                 print("\n[System] Остановлено пользователем.")
