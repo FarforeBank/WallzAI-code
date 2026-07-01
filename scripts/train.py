@@ -1,79 +1,97 @@
-# scripts/train.py
+import time
 import os
 import sys
 
-# Добавляем корневую папку WallzAi в пути поиска модулей, чтобы Python видел пакет envs
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Обеспечиваем доступ к корню проекта для импорта envs
+BASE_DIR = os.getcwd()
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
 
+from playwright.sync_api import sync_playwright, TimeoutError
 from sb3_contrib import MaskablePPO
-from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.utils import set_random_seed
-
 from envs.quoridor.quoridor_env import QuoridorEnv
 
-def make_env(rank, seed=0):
-    """
-    Утилита для создания многопроцессорной среды.
-    """
-    def _init():
-        env = QuoridorEnv() # Вызов без аргумента engine
-        env.reset(seed=seed + rank)
-        return env
-    set_random_seed(seed)
-    return _init
+# Пути к файлам
+PROFILE_DIR = os.path.join(BASE_DIR, "browser_profile")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model", "best_model.zip")
 
-def main():
-    # Создаем директории для логов и моделей
-    os.makedirs("./models", exist_ok=True)
-    os.makedirs("./logs", exist_ok=True)
+class BrowserBot:
+    def __init__(self):
+        self.env = QuoridorEnv()
+        self.obs, _ = self.env.reset()
+        
+        # Загрузка модели
+        if os.path.exists(MODEL_PATH):
+            self.model = MaskablePPO.load(MODEL_PATH)
+            print(f"[System] Модель загружена: {MODEL_PATH}")
+        else:
+            print("[System] Модель не найдена, используем случайные веса.")
+            self.model = MaskablePPO("MlpPolicy", self.env)
 
-    num_envs = 24
-    print(f"Инициализация {num_envs} параллельных сред...")
-    
-    # Создаем многопроцессорную среду для ускорения обучения
-    env = SubprocVecEnv([make_env(i) for i in range(num_envs)])
-    
-    # Создаем среду для тестов и оборачиваем в Monitor и DummyVecEnv 
-    raw_eval_env = QuoridorEnv()
-    monitored_eval_env = Monitor(raw_eval_env)
-    eval_env = DummyVecEnv([lambda: monitored_eval_env])
+    def run(self):
+        with sync_playwright() as p:
+            print(f"[System] Используем профиль: {PROFILE_DIR}")
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR, 
+                headless=False, 
+                slow_mo=200
+            )
+            
+            page = context.pages[0] if context.pages else context.new_page()
+            print("[Browser] Открываем Wallz.gg...")
+            page.goto("https://wallz.gg/")
+            
+            input("[Управление] Зайди в игру (Local/Arcade). Нажми ENTER, когда увидишь доску...")
 
-    print("Инициализация MaskablePPO...")
-    model = MaskablePPO(
-        "MlpPolicy",
-        env,
-        learning_rate=5e-5,       
-        n_steps=2048,             
-        batch_size=512,           
-        clip_range=0.1,           
-        ent_coef=0.02,            
-        gamma=0.99,
-        verbose=1,
-        tensorboard_log="./logs/",
-        device="cpu"  # Возвращаем CPU для максимальной скорости (~16000 FPS)
-    )
+            print("\n[Калибровка] Ждем загрузки доски...")
+            board_svg = page.locator(".w-full.h-full").first
+            board_svg.wait_for(state="visible", timeout=40000)
+            
+            # Калибровка масштаба
+            svg_box = board_svg.bounding_box()
+            print(f"[Калибровка] Успешно! Масштаб: {svg_box['width']/660:.2f}")
 
-    eval_callback = EvalCallback(
-        eval_env, 
-        best_model_save_path='./models/best_model',
-        log_path='./logs/eval', 
-        eval_freq=500,  # Тесты и вывод наград будут печататься чаще (каждые 10 000 глобальных шагов)
-        deterministic=False, 
-        render=False
-    )
+            print("[System] Бот перехватывает управление!")
+            self._play_loop(page, board_svg)
+            
+            context.close()
 
-    print("Запуск обучения (останови через Ctrl+C)...")
-    try:
-        # Добавлен параметр progress_bar=True для отображения ETA
-        model.learn(total_timesteps=3_000_000, callback=eval_callback, progress_bar=True)
-    except KeyboardInterrupt:
-        print("\nОбучение прервано пользователем. Сохраняем прогресс...")
-    finally:
-        model.save("models/quoridor_latest")
-        print("Модель сохранена.")
-        env.close()
+    def _play_loop(self, page, board_svg):
+        while True:
+            try:
+                # Парсинг фишек
+                chips = board_svg.locator("circle")
+                if chips.count() < 2:
+                    time.sleep(1)
+                    continue
+
+                # Координаты (первая фишка - наша)
+                cx = float(chips.nth(0).get_attribute("cx"))
+                cy = float(chips.nth(0).get_attribute("cy"))
+                print(f"[Зрение] P1: [{int(cx/71.5)}, {int(cy/71.5)}]")
+
+                # Предсказание действия
+                masks = self.env.action_masks()
+                masks[4:] = 0 # Запрещаем стены для теста
+                action, _ = self.model.predict(self.obs, action_masks=masks, deterministic=True)
+                
+                # Клик
+                if action < 4:
+                    dx, dy = [(0,-71.5), (0,71.5), (-71.5,0), (71.5,0)][int(action)]
+                    svg_box = board_svg.bounding_box()
+                    page.mouse.click(svg_box["x"] + cx + dx, svg_box["y"] + cy + dy)
+                    print(f"[Действие] Шагаю на {action}")
+                
+                # Обновление среды
+                self.obs, _, term, trunc, _ = self.env.step(action)
+                if term or trunc:
+                    self.obs, _ = self.env.reset()
+                
+                time.sleep(1)
+            except Exception as e:
+                print(f"[Ошибка] {e}")
+                time.sleep(2)
 
 if __name__ == "__main__":
-    main()
+    bot = BrowserBot()
+    bot.run()
