@@ -460,16 +460,33 @@ class BrowserAgent:
         return options
 
     def choose_action(self, predicted, options, p1_pos):
-        if predicted in options:
-            return predicted, False
         move_actions = [a for a in options if a < MOVE_ACTIONS]
+
+        def move_score(action):
+            target = options[action].get("target_pos", p1_pos)
+            dist = self.env.engine.get_bfs_distance(target, 0)
+            recent_repeat = 4.0 if target in self.position_history[-4:] else 0.0
+            immediate_backtrack = 6.0 if len(self.position_history) >= 2 and target == self.position_history[-2] else 0.0
+            center_bias = abs(target[0] - 4) * 0.05
+            return dist + recent_repeat + immediate_backtrack + center_bias
+
+        def is_bad_cycle(action):
+            if action not in move_actions:
+                return False
+            target = options[action].get("target_pos", p1_pos)
+            return target in self.position_history[-4:]
+
+        if predicted in options:
+            if predicted in move_actions and is_bad_cycle(predicted):
+                fresh_moves = [a for a in move_actions if not is_bad_cycle(a)]
+                if fresh_moves:
+                    fallback = min(fresh_moves, key=move_score)
+                    print(f"[CycleGuard] {action_name(predicted)}->{action_name(fallback)}")
+                    return fallback, True
+            return predicted, False
+
         if move_actions:
-            def score(action):
-                target = options[action].get("target_pos", p1_pos)
-                dist = self.env.engine.get_bfs_distance(target, 0)
-                repeat = 2.0 if target in self.position_history[-4:] else 0.0
-                return dist + repeat + abs(target[0] - 4) * 0.05
-            return min(move_actions, key=score), True
+            return min(move_actions, key=move_score), True
         if options:
             return next(iter(options)), True
         return None, False
@@ -537,27 +554,40 @@ class BrowserAgent:
         r, c, orientation = parts
         wall_set_name = "H" if orientation == "H" else "V"
 
-        for _ in range(6):
+        for _ in range(8):
             self.clear_wall_preview(page)
             state = self.read_board(page)
             if state is None:
                 time.sleep(0.2)
                 continue
-            horizontal, vertical = self.parse_walls(state, self.last_centers)
+            centers = self.cell_centers(state)
+            if len(centers[0]) >= 9 and len(centers[1]) >= 9:
+                self.last_centers = centers
+            else:
+                centers = self.last_centers
+            horizontal, vertical = self.parse_walls(state, centers)
             self.screen_horizontal = horizontal
             self.screen_vertical = vertical
             expected = (r, c) in (horizontal if orientation == "H" else vertical)
             if expected:
                 self.wall_failures = 0
-                self.failed_wall_actions.clear()
+                self.failed_wall_actions.discard(action)
                 self.walls_left = max(0, min(self.walls_left, old_left - 1))
                 self.env.engine.walls_left[1] = self.walls_left
                 print(f"[WallOK] committed {wall_set_name}({r},{c}), local walls={self.walls_left}")
                 return True
-            time.sleep(0.2)
+            time.sleep(0.25)
 
         state = self.read_board(page)
-        horizontal, vertical = self.parse_walls(state, self.last_centers) if state else (set(), set())
+        if state:
+            centers = self.cell_centers(state)
+            if len(centers[0]) >= 9 and len(centers[1]) >= 9:
+                self.last_centers = centers
+            else:
+                centers = self.last_centers
+            horizontal, vertical = self.parse_walls(state, centers)
+        else:
+            horizontal, vertical = set(), set()
         self.screen_horizontal = horizontal
         self.screen_vertical = vertical
         self.failed_wall_actions.add(action)
