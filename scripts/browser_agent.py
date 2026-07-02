@@ -146,6 +146,15 @@ def clamp_slot(value):
     return max(0, min(7, int(round(value))))
 
 
+def wall_boundaries(centers):
+    xs, ys = centers
+    if len(xs) < 9 or len(ys) < 9:
+        return [], []
+    bx = [(xs[i] + xs[i + 1]) / 2.0 for i in range(8)]
+    by = [(ys[i] + ys[i + 1]) / 2.0 for i in range(8)]
+    return bx, by
+
+
 class BrowserAgent:
     def __init__(self, model_path: Path, allow_walls: bool, wall_fail_limit: int):
         self.env = QuoridorEnv(wall_candidate_limit=40)
@@ -157,6 +166,7 @@ class BrowserAgent:
         self.failed_wall_actions = set()
         self.own_color = None
         self.last_own_xy = None
+        self.last_centers = None
         self.position_history = []
         self.screen_horizontal = set()
         self.screen_vertical = set()
@@ -262,7 +272,19 @@ class BrowserAgent:
         xs, ys = centers
         return nearest_index(item["x"], xs), nearest_index(item["y"], ys)
 
-    def parse_walls(self, state):
+    def wall_slot_from_screen(self, item, centers):
+        bx, by = wall_boundaries(centers)
+        if len(bx) < 8 or len(by) < 8:
+            return None
+        return nearest_index(item["y"], by), nearest_index(item["x"], bx)
+
+    def wall_point_from_slot(self, centers, r, c):
+        bx, by = wall_boundaries(centers)
+        if len(bx) < 8 or len(by) < 8:
+            return None
+        return {"x": float(bx[c]), "y": float(by[r])}
+
+    def parse_walls(self, state, centers=None):
         horizontal = set()
         vertical = set()
         for item in state["rects"]:
@@ -270,28 +292,36 @@ class BrowserAgent:
             raw_y = item.get("rawY")
             raw_w = item.get("rawW")
             raw_h = item.get("rawH")
-            if raw_x is None or raw_y is None or raw_w is None or raw_h is None:
-                continue
 
-            is_h = abs(raw_w - 132) <= 18 and abs(raw_h - 12) <= 8
-            is_v = abs(raw_w - 12) <= 8 and abs(raw_h - 132) <= 18
+            raw_h_wall = raw_w is not None and raw_h is not None and abs(raw_w - 132) <= 18 and abs(raw_h - 12) <= 8
+            raw_v_wall = raw_w is not None and raw_h is not None and abs(raw_w - 12) <= 8 and abs(raw_h - 132) <= 18
+            ratio = item["w"] / item["h"] if item["h"] else 0
+            screen_h_wall = ratio >= 3.0 and item["w"] >= 30 and item["h"] <= 24
+            screen_v_wall = ratio <= 0.33 and item["h"] >= 30 and item["w"] <= 24
+            is_h = raw_h_wall or screen_h_wall
+            is_v = raw_v_wall or screen_v_wall
             if not is_h and not is_v:
                 continue
 
             text = f"{item.get('attrFill', '')} {item.get('fill', '')}".lower()
-            # Do not count the drag/hover preview as a real wall. Real placed walls
-            # are rendered with player colors; the tray/preview uses color-wall.
+            # color-wall is the tray/hover preview. Count only committed player-colored walls.
             if "color-p" not in text:
                 continue
 
+            slot = self.wall_slot_from_screen(item, centers) if centers is not None else None
+            if slot is None:
+                if raw_x is None or raw_y is None or raw_w is None or raw_h is None:
+                    continue
+                if is_h:
+                    slot = (clamp_slot(((raw_y + raw_h / 2) - 66) / 72), clamp_slot(raw_x / 72))
+                else:
+                    slot = (clamp_slot(raw_y / 72), clamp_slot(((raw_x + raw_w / 2) - 66) / 72))
+
+            r, c = slot
             if is_h:
-                raw_c = clamp_slot(raw_x / 72)
-                raw_r = clamp_slot(((raw_y + raw_h / 2) - 66) / 72)
-                horizontal.add((7 - raw_r, 7 - raw_c))
+                horizontal.add((r, c))
             else:
-                raw_c = clamp_slot(((raw_x + raw_w / 2) - 66) / 72)
-                raw_r = clamp_slot(raw_y / 72)
-                vertical.add((7 - raw_r, 7 - raw_c))
+                vertical.add((r, c))
         return horizontal, vertical
 
     def pick_pawns(self, state):
@@ -352,9 +382,10 @@ class BrowserAgent:
             self.env.engine.walls_left[1] = self.walls_left
 
     def sync_env(self, page, own, opponent, state, centers):
+        self.last_centers = centers
         p1_pos = self.grid_pos(own, centers)
         p2_pos = self.grid_pos(opponent, centers) if opponent else self.env.engine.p2_pos
-        horizontal, vertical = self.parse_walls(state)
+        horizontal, vertical = self.parse_walls(state, centers)
         self.screen_horizontal = horizontal
         self.screen_vertical = vertical
 
@@ -407,24 +438,7 @@ class BrowserAgent:
             or (r, c) in self.screen_horizontal
         )
 
-    def raw_wall_point(self, page, raw_r, raw_c, orientation):
-        return page.evaluate(
-            """
-            ({ r, c, orientation }) => {
-                const svg = document.querySelector('svg[aria-label="Wallz board"]');
-                if (!svg) return null;
-                const group = svg.querySelector('g[transform*="rotate"]') || svg;
-                const point = svg.createSVGPoint();
-                point.x = 66 + 72 * c;
-                point.y = 66 + 72 * r;
-                const screen = point.matrixTransform(group.getScreenCTM());
-                return { x: screen.x, y: screen.y };
-            }
-            """,
-            {"r": int(raw_r), "c": int(raw_c), "orientation": orientation},
-        )
-
-    def wall_options(self, page):
+    def wall_options(self, centers):
         if not self.allow_walls or self.walls_left <= 0:
             return {}
         masks = self.env.action_masks()
@@ -433,8 +447,7 @@ class BrowserAgent:
             if action in self.failed_wall_actions or not masks[action] or self.wall_conflicts_screen(action):
                 continue
             r, c, orientation = wall_action_parts(action)
-            raw_r, raw_c = 7 - r, 7 - c
-            point = self.raw_wall_point(page, raw_r, raw_c, orientation)
+            point = self.wall_point_from_slot(centers, r, c)
             if point is None:
                 continue
             options[action] = {
@@ -443,7 +456,6 @@ class BrowserAgent:
                 "y": float(point["y"]),
                 "orientation": orientation,
                 "wall_rc": (r, c),
-                "raw_rc": (raw_r, raw_c),
             }
         return options
 
@@ -483,7 +495,7 @@ class BrowserAgent:
         sy = box["y"] + box["height"] / 2.0
         ex = target["x"]
         ey = target["y"]
-        print(f"[Wall] {action_name(action)} env={target['wall_rc']} raw={target['raw_rc']} drop=({ex:.1f},{ey:.1f})")
+        print(f"[Wall] {action_name(action)} env={target['wall_rc']} drop=({ex:.1f},{ey:.1f})")
         page.bring_to_front()
         page.evaluate("() => window.focus()")
 
@@ -511,7 +523,6 @@ class BrowserAgent:
         page.mouse.move(sx, sy - 8, steps=4)
         page.mouse.move((sx + ex) / 2.0, (sy + ey) / 2.0, steps=24)
         page.mouse.move(ex, ey, steps=32)
-        # Tiny wiggle keeps React pointer state updated before release.
         page.mouse.move(ex + 2.0, ey + 2.0, steps=4)
         page.mouse.move(ex, ey, steps=4)
         time.sleep(0.25)
@@ -532,15 +543,13 @@ class BrowserAgent:
             if state is None:
                 time.sleep(0.2)
                 continue
-            horizontal, vertical = self.parse_walls(state)
+            horizontal, vertical = self.parse_walls(state, self.last_centers)
             self.screen_horizontal = horizontal
             self.screen_vertical = vertical
             expected = (r, c) in (horizontal if orientation == "H" else vertical)
             if expected:
                 self.wall_failures = 0
                 self.failed_wall_actions.clear()
-                # The textual counter can lag or point at the other player. For local planning,
-                # trust the committed SVG wall and decrement from the previous local count.
                 self.walls_left = max(0, min(self.walls_left, old_left - 1))
                 self.env.engine.walls_left[1] = self.walls_left
                 print(f"[WallOK] committed {wall_set_name}({r},{c}), local walls={self.walls_left}")
@@ -548,7 +557,7 @@ class BrowserAgent:
             time.sleep(0.2)
 
         state = self.read_board(page)
-        horizontal, vertical = self.parse_walls(state) if state else (set(), set())
+        horizontal, vertical = self.parse_walls(state, self.last_centers) if state else (set(), set())
         self.screen_horizontal = horizontal
         self.screen_vertical = vertical
         self.failed_wall_actions.add(action)
@@ -565,6 +574,7 @@ class BrowserAgent:
     def reset_identity(self):
         self.own_color = None
         self.last_own_xy = None
+        self.last_centers = None
         self.position_history.clear()
         self.failed_wall_actions.clear()
         self.wall_failures = 0
@@ -599,7 +609,7 @@ class BrowserAgent:
 
                 options = self.move_options(own, state, centers)
                 if self.allow_walls:
-                    options.update(self.wall_options(page))
+                    options.update(self.wall_options(centers))
                 if not options:
                     print(f"[Wait] not our turn P1={p1_pos} P2={p2_pos} walls={self.walls_left}")
                     time.sleep(0.7)
