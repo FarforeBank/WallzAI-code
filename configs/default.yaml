@@ -1,0 +1,33 @@
+seed: 42
+device: auto
+torch_threads: 1
+
+env:
+  max_moves: 300
+
+model:
+  channels: 32
+  residual_blocks: 2
+
+training:
+  total_positions: 100000
+  games_per_iter: 16
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gamma: 0.997
+  ppo_epochs: 4
+  minibatch_size: 256
+  clip_range: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 1.0
+  dense_shaping: false
+  shaping_coef: 0.03
+  eval_every_positions: 10000
+  save_every_positions: 10000
+
+evaluation:
+  games: 20
+
+paths:
+  run_dir: runs/wallz_ppo
