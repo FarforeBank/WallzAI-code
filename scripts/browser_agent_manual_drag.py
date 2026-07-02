@@ -60,6 +60,25 @@ def mirrored_wall_click_point(self, action, centers):
     return None
 
 
+def _svg_slot_screen_point(page, r, c):
+    """Map a raw SVG wall slot to viewport pixels through the rotated board group."""
+    return page.evaluate(
+        """
+        ({ r, c }) => {
+            const svg = document.querySelector('svg[aria-label="Wallz board"]');
+            if (!svg) return null;
+            const group = svg.querySelector('g[transform*="rotate"]') || svg;
+            const point = svg.createSVGPoint();
+            point.x = 66 + 72 * c;
+            point.y = 66 + 72 * r;
+            const transformed = point.matrixTransform(group.getScreenCTM());
+            return { x: transformed.x, y: transformed.y };
+        }
+        """,
+        {"r": int(r), "c": int(c)},
+    )
+
+
 def _dispatch_release_events(page, x, y):
     page.evaluate(
         """
@@ -101,8 +120,20 @@ def _manual_drag_wall_from_tray(page, orientation, target):
 
     start_x = box["x"] + box["width"] / 2.0
     start_y = box["y"] + box["height"] / 2.0
-    end_x = target["x"]
-    end_y = target["y"]
+
+    drop_rc = target.get("drop_rc")
+    if drop_rc is not None:
+        point = _svg_slot_screen_point(page, drop_rc[0], drop_rc[1])
+        if point is not None:
+            end_x = float(point["x"])
+            end_y = float(point["y"])
+            print(f"[Стена] SVG drop raw={drop_rc} -> ({end_x:.1f}, {end_y:.1f})")
+        else:
+            end_x = target["x"]
+            end_y = target["y"]
+    else:
+        end_x = target["x"]
+        end_y = target["y"]
 
     page.mouse.move(start_x, start_y)
     time.sleep(0.10)
