@@ -1,6 +1,10 @@
-gymnasium
 numpy
+torch
+PyYAML
 playwright
+pytest
+# Legacy stage scripts still import these; new wallz_ai training does not depend on SB3.
+gymnasium
 stable-baselines3
 sb3-contrib
 tqdm
