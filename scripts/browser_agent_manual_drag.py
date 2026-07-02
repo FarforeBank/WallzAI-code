@@ -7,9 +7,57 @@ Wallz does not commit the drop on mouse release.
 import time
 
 import browser_agent_safe as safe_agent
+from browser_agent import H_WALL_OFFSET, MOVE_ACTIONS, TOTAL_ACTIONS, V_WALL_OFFSET
 
 
 safe_agent.MODEL_ALIASES["stage8"] = safe_agent.ROOT_DIR / "models" / "best_model_stage8" / "best_model.zip"
+
+
+def mirrored_wall_click_point(self, action, centers):
+    """Return a visual drop point that matches safe_agent's mirrored SVG parser.
+
+    The Wallz board SVG is rotated 180 degrees. safe_svg_wall_from_item mirrors
+    parsed SVG coordinates back into the training/env coordinate system. Therefore
+    a desired env wall (r, c) must be physically dropped at raw visual slot
+    (7-r, 7-c), otherwise the site commits the mirror slot.
+    """
+    xs, ys = centers
+    if len(xs) < 9 or len(ys) < 9:
+        return None
+
+    if H_WALL_OFFSET <= action < V_WALL_OFFSET:
+        idx = action - H_WALL_OFFSET
+        r, c = divmod(idx, 8)
+        drop_r, drop_c = 7 - r, 7 - c
+        x, y = safe_agent._wall_slot_center(xs, ys, drop_r, drop_c)
+        return {
+            "x": x,
+            "y": y,
+            "r": 0.0,
+            "synthetic": False,
+            "kind": "wall-drag",
+            "orientation": "H",
+            "wall_rc": (r, c),
+            "drop_rc": (drop_r, drop_c),
+        }
+
+    if V_WALL_OFFSET <= action < TOTAL_ACTIONS:
+        idx = action - V_WALL_OFFSET
+        r, c = divmod(idx, 8)
+        drop_r, drop_c = 7 - r, 7 - c
+        x, y = safe_agent._wall_slot_center(xs, ys, drop_r, drop_c)
+        return {
+            "x": x,
+            "y": y,
+            "r": 0.0,
+            "synthetic": False,
+            "kind": "wall-drag",
+            "orientation": "V",
+            "wall_rc": (r, c),
+            "drop_rc": (drop_r, drop_c),
+        }
+
+    return None
 
 
 def _dispatch_release_events(page, x, y):
@@ -84,6 +132,7 @@ def drag_wall_from_tray(page, board, orientation, target):
     _manual_drag_wall_from_tray(page, orientation, target)
 
 
+safe_agent.safe_wall_click_point = mirrored_wall_click_point
 safe_agent.drag_wall_from_tray = drag_wall_from_tray
 
 
