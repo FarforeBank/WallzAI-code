@@ -279,7 +279,9 @@ class BrowserAgent:
                 continue
 
             text = f"{item.get('attrFill', '')} {item.get('fill', '')}".lower()
-            if "color-p" not in text and "color-wall" not in text:
+            # Do not count the drag/hover preview as a real wall. Real placed walls
+            # are rendered with player colors; the tray/preview uses color-wall.
+            if "color-p" not in text:
                 continue
 
             if is_h:
@@ -408,7 +410,7 @@ class BrowserAgent:
     def raw_wall_point(self, page, raw_r, raw_c, orientation):
         return page.evaluate(
             """
-            ({ r, c }) => {
+            ({ r, c, orientation }) => {
                 const svg = document.querySelector('svg[aria-label="Wallz board"]');
                 if (!svg) return null;
                 const group = svg.querySelector('g[transform*="rotate"]') || svg;
@@ -419,7 +421,7 @@ class BrowserAgent:
                 return { x: screen.x, y: screen.y };
             }
             """,
-            {"r": int(raw_r), "c": int(raw_c)},
+            {"r": int(raw_r), "c": int(raw_c), "orientation": orientation},
         )
 
     def wall_options(self, page):
@@ -465,6 +467,13 @@ class BrowserAgent:
             return page.locator("button[aria-label*='horizontal wall']").first
         return page.locator("button[aria-label*='vertical wall']").first
 
+    def clear_wall_preview(self, page):
+        try:
+            page.mouse.move(8, 8, steps=4)
+            time.sleep(0.25)
+        except Exception:
+            pass
+
     def drag_wall(self, page, action, target):
         locator = self.tray_button(page, target["orientation"])
         box = locator.bounding_box(timeout=1500)
@@ -477,44 +486,76 @@ class BrowserAgent:
         print(f"[Wall] {action_name(action)} env={target['wall_rc']} raw={target['raw_rc']} drop=({ex:.1f},{ey:.1f})")
         page.bring_to_front()
         page.evaluate("() => window.focus()")
+
+        board = page.locator('svg[aria-label="Wallz board"]').first
+        board_box = board.bounding_box(timeout=1500)
+        if board_box is not None:
+            try:
+                locator.drag_to(
+                    board,
+                    source_position={"x": box["width"] / 2.0, "y": box["height"] / 2.0},
+                    target_position={"x": ex - board_box["x"], "y": ey - board_box["y"]},
+                    timeout=3500,
+                    force=True,
+                )
+                time.sleep(0.45)
+                self.clear_wall_preview(page)
+                return
+            except Exception as exc:
+                print(f"[WallDragFallback] locator.drag_to failed: {type(exc).__name__}: {exc}")
+
         page.mouse.move(sx, sy)
-        time.sleep(0.10)
+        time.sleep(0.18)
         page.mouse.down(button="left")
-        time.sleep(0.22)
-        page.mouse.move((sx + ex) / 2.0, (sy + ey) / 2.0, steps=20)
-        page.mouse.move(ex, ey, steps=28)
-        time.sleep(0.20)
-        page.mouse.move(ex + 1.0, ey + 1.0, steps=3)
-        page.mouse.move(ex, ey, steps=3)
-        time.sleep(0.08)
+        time.sleep(0.35)
+        page.mouse.move(sx, sy - 8, steps=4)
+        page.mouse.move((sx + ex) / 2.0, (sy + ey) / 2.0, steps=24)
+        page.mouse.move(ex, ey, steps=32)
+        # Tiny wiggle keeps React pointer state updated before release.
+        page.mouse.move(ex + 2.0, ey + 2.0, steps=4)
+        page.mouse.move(ex, ey, steps=4)
+        time.sleep(0.25)
         page.mouse.up(button="left")
-        time.sleep(0.9)
+        time.sleep(0.45)
+        self.clear_wall_preview(page)
 
     def verify_wall(self, page, action, old_walls, old_left):
-        state = self.read_board(page)
-        if state is None:
-            return False
-        horizontal, vertical = self.parse_walls(state)
-        self.screen_horizontal = horizontal
-        self.screen_vertical = vertical
-        self.read_walls_left(page)
         parts = wall_action_parts(action)
         if parts is None:
             return False
         r, c, orientation = parts
-        expected = (r, c) in (horizontal if orientation == "H" else vertical)
-        new_total = len(horizontal) + len(vertical)
-        old_total = old_walls[0] + old_walls[1]
-        left_decreased = self.walls_left < old_left
-        if expected and (new_total > old_total or left_decreased):
-            self.wall_failures = 0
-            self.failed_wall_actions.clear()
-            return True
+        wall_set_name = "H" if orientation == "H" else "V"
+
+        for _ in range(6):
+            self.clear_wall_preview(page)
+            state = self.read_board(page)
+            if state is None:
+                time.sleep(0.2)
+                continue
+            horizontal, vertical = self.parse_walls(state)
+            self.screen_horizontal = horizontal
+            self.screen_vertical = vertical
+            expected = (r, c) in (horizontal if orientation == "H" else vertical)
+            if expected:
+                self.wall_failures = 0
+                self.failed_wall_actions.clear()
+                # The textual counter can lag or point at the other player. For local planning,
+                # trust the committed SVG wall and decrement from the previous local count.
+                self.walls_left = max(0, min(self.walls_left, old_left - 1))
+                self.env.engine.walls_left[1] = self.walls_left
+                print(f"[WallOK] committed {wall_set_name}({r},{c}), local walls={self.walls_left}")
+                return True
+            time.sleep(0.2)
+
+        state = self.read_board(page)
+        horizontal, vertical = self.parse_walls(state) if state else (set(), set())
+        self.screen_horizontal = horizontal
+        self.screen_vertical = vertical
         self.failed_wall_actions.add(action)
         self.wall_failures += 1
         print(
-            f"[WallFail] expected {orientation}({r},{c}), got H={sorted(horizontal)} V={sorted(vertical)}, "
-            f"left {old_left}->{self.walls_left}, failures={self.wall_failures}"
+            f"[WallFail] no committed {wall_set_name}({r},{c}); got H={sorted(horizontal)} V={sorted(vertical)}, "
+            f"text-left was {old_left}->{self.walls_left}, failures={self.wall_failures}"
         )
         if self.wall_fail_limit and self.wall_failures >= self.wall_fail_limit:
             self.allow_walls = False
