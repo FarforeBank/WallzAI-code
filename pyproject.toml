@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wallz-ai"
+version = "0.1.0"
+description = "Local Wallz.gg simulator and masked self-play training pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "PyYAML",
+    "playwright",
+]
+
+[tool.setuptools.packages.find]
+include = ["wallz_ai*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
